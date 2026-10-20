@@ -1,0 +1,46 @@
+[package]
+name = "deltalake-lakefs"
+version = "2.0.0"
+authors.workspace = true
+keywords.workspace = true
+readme.workspace = true
+edition.workspace = true
+homepage.workspace = true
+description.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+deltalake-core = { version = "2.0", path = "../core", default-features = false, features = ["cloud"]}
+# workspace dependencies
+async-trait = { workspace = true }
+bytes = { workspace = true }
+tracing = { workspace = true }
+object_store = { workspace = true, features = ["aws"]}
+thiserror = { workspace = true }
+tokio = { workspace = true }
+uuid = { workspace = true, features = ["serde", "v4"] }
+url = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+reqwest = { version = "0.13", default-features = false, features = ["http2", "json", "rustls"] }
+reqwest-middleware = { version = "0.5", features = ["json"] }
+reqwest-retry = "0.9"
+
+[dev-dependencies]
+deltalake-core = { path = "../core" }
+chrono = { workspace = true }
+serial_test = "3"
+deltalake-test = { path = "../test" }
+pretty_env_logger = "0.5.0"
+rand = "0.10"
+which = "7"
+maplit = "1"
+mockito =  { version = "1.6.1"}
+
+[features]
+default = ["rustls"]
+native-tls = ["deltalake-core/native-tls"]
+rustls = ["deltalake-core/rustls"]
+integration_test_lakefs = []

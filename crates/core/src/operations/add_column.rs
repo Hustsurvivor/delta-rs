@@ -1,0 +1,136 @@
+//! Add a new column to a table
+
+use delta_kernel::schema::StructType;
+use delta_kernel::table_features::ColumnMappingMode;
+use futures::future::BoxFuture;
+use itertools::Itertools;
+
+use crate::errors::ColumnMappingOperation;
+use crate::kernel::schema::merge_delta_struct;
+use crate::kernel::transaction::CommitProperties;
+use crate::kernel::{
+    Action, EagerSnapshot, MetadataExt, ProtocolExt as _, SnapshotMetadataRef, StructField,
+    StructTypeExt, resolve_snapshot,
+};
+use crate::logstore::LogStoreRef;
+use crate::operations::commit_actions_in_scope;
+use crate::protocol::DeltaOperation;
+use crate::{DeltaResult, DeltaTable, DeltaTableError};
+
+/// Add new columns and/or nested fields to a table
+pub struct AddColumnBuilder {
+    /// A snapshot of the table's state
+    snapshot: Option<EagerSnapshot>,
+    /// Fields to add/merge into schema
+    fields: Option<Vec<StructField>>,
+    /// Delta object store for handling data files
+    log_store: LogStoreRef,
+    /// Additional information to add to the commit
+    commit_properties: CommitProperties,
+}
+
+impl AddColumnBuilder {
+    /// Create a new builder
+    pub(crate) fn new(log_store: LogStoreRef, snapshot: Option<EagerSnapshot>) -> Self {
+        Self {
+            snapshot,
+            log_store,
+            fields: None,
+            commit_properties: CommitProperties::default(),
+        }
+    }
+
+    /// Specify the fields to be added
+    pub fn with_fields(mut self, fields: impl IntoIterator<Item = StructField> + Clone) -> Self {
+        self.fields = Some(fields.into_iter().collect());
+        self
+    }
+    /// Additional metadata to be added to commit info
+    pub fn with_commit_properties(mut self, commit_properties: CommitProperties) -> Self {
+        self.commit_properties = commit_properties;
+        self
+    }
+}
+
+fn plan_add_column_actions(
+    snapshot: SnapshotMetadataRef<'_>,
+    fields: Vec<StructField>,
+) -> DeltaResult<(Vec<Action>, DeltaOperation)> {
+    let mut metadata = snapshot.metadata.clone();
+    let fields_right = &StructType::try_new(fields.clone())?;
+
+    if !fields_right
+        .get_generated_columns()
+        .unwrap_or_default()
+        .is_empty()
+    {
+        return Err(DeltaTableError::Generic(
+            "New columns cannot be a generated column".to_string(),
+        ));
+    }
+
+    let table_schema = snapshot.table_configuration.logical_schema();
+    let new_table_schema = merge_delta_struct(table_schema.as_ref(), fields_right)?;
+
+    let current_protocol = snapshot.protocol;
+    let new_protocol = current_protocol
+        .clone()
+        .apply_column_metadata_to_protocol(&new_table_schema)?
+        .move_table_properties_into_features(metadata.configuration());
+
+    let operation = DeltaOperation::AddColumn {
+        fields: fields.into_iter().collect_vec(),
+    };
+
+    metadata = metadata.with_schema(&new_table_schema)?;
+
+    let mut actions = vec![metadata.into()];
+
+    if current_protocol != &new_protocol {
+        actions.push(new_protocol.into())
+    }
+
+    Ok((actions, operation))
+}
+
+impl std::future::IntoFuture for AddColumnBuilder {
+    type Output = DeltaResult<DeltaTable>;
+
+    type IntoFuture = BoxFuture<'static, Self::Output>;
+
+    fn into_future(self) -> Self::IntoFuture {
+        let this = self;
+
+        Box::pin(async move {
+            let snapshot = resolve_snapshot(&this.log_store, this.snapshot.clone(), None).await?;
+            if snapshot
+                .snapshot()
+                .metadata_state()
+                .table_configuration
+                .column_mapping_mode()
+                != ColumnMappingMode::None
+            {
+                return Err(DeltaTableError::unsupported_column_mapping(
+                    ColumnMappingOperation::Write,
+                    "ADD COLUMN",
+                ));
+            }
+
+            let fields = match this.fields.clone() {
+                Some(v) => v,
+                None => return Err(DeltaTableError::Generic("No fields provided".to_string())),
+            };
+            let (actions, operation) =
+                plan_add_column_actions(snapshot.snapshot().metadata_state(), fields)?;
+
+            commit_actions_in_scope(
+                &this.log_store,
+                &snapshot,
+                this.commit_properties,
+                actions,
+                operation,
+            )
+            .await
+        })
+    }
+}

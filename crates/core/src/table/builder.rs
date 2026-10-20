@@ -1,0 +1,732 @@
+//! Create or load DeltaTables
+
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use chrono::{DateTime, FixedOffset, Utc};
+use object_store::DynObjectStore;
+use tracing::debug;
+use url::Url;
+
+use super::normalize_table_url;
+use crate::kernel::Version;
+use crate::logstore::storage::IORuntime;
+use crate::logstore::{LogStoreRef, StorageConfig, object_store_factories};
+use crate::{DeltaResult, DeltaTable, DeltaTableError};
+
+/// possible version specifications for loading a delta table
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Default)]
+pub enum DeltaVersion {
+    /// load the newest version
+    #[default]
+    Newest,
+    /// specify the version to load
+    Version(Version),
+    /// specify the timestamp in UTC
+    Timestamp(DateTime<Utc>),
+}
+
+/// builder for configuring a delta table load.
+#[derive(Debug)]
+pub struct DeltaTableBuilder {
+    /// table root uri
+    table_url: Url,
+    /// backend to access storage system
+    storage_backend: Option<(Arc<DynObjectStore>, Url)>,
+    /// specify the version we are going to load: a time stamp, a version, or just the newest
+    /// available version
+    version: DeltaVersion,
+    storage_options: Option<HashMap<String, String>>,
+    allow_http: Option<bool>,
+    io_runtime: Option<IORuntime>,
+}
+
+impl DeltaTableBuilder {
+    /// Creates `DeltaTableBuilder` from table URL
+    ///
+    /// ```rust
+    /// # use deltalake_core::table::builder::*;
+    /// # use url::Url;
+    /// let url = Url::parse("memory:///test").unwrap();
+    /// let builder = DeltaTableBuilder::from_url(url);
+    /// ```
+    pub fn from_url(table_url: Url) -> DeltaResult<Self> {
+        // We cannot trust that a [Url] has had it's .. segments canonicalized out of the path
+        // See <https://github.com/servo/rust-url/issues/1086>
+        let table_url = Url::parse(table_url.as_str()).map_err(|_| {
+            DeltaTableError::NotATable(
+                "Received path segments that could not be canonicalized".into(),
+            )
+        })?;
+
+        debug!("creating table builder with {table_url}");
+
+        Ok(Self {
+            table_url,
+            storage_backend: None,
+            version: DeltaVersion::default(),
+            storage_options: None,
+            allow_http: None,
+            io_runtime: None,
+        })
+    }
+
+    /// Sets `version` to the builder
+    pub fn with_version(mut self, version: Version) -> Self {
+        self.version = DeltaVersion::Version(version);
+        self
+    }
+
+    /// specify the timestamp given as ISO-8601/RFC-3339 timestamp
+    pub fn with_datestring(self, date_string: impl AsRef<str>) -> DeltaResult<Self> {
+        let datetime = DateTime::<Utc>::from(DateTime::<FixedOffset>::parse_from_rfc3339(
+            date_string.as_ref(),
+        )?);
+        Ok(self.with_timestamp(datetime))
+    }
+
+    /// specify a timestamp
+    pub fn with_timestamp(mut self, timestamp: DateTime<Utc>) -> Self {
+        self.version = DeltaVersion::Timestamp(timestamp);
+        self
+    }
+
+    /// Set the storage backend.
+    ///
+    /// If a backend is not provided then it is derived from `location`.
+    ///
+    /// # Arguments
+    ///
+    /// * `root_storage` - A shared reference to an [`ObjectStore`](object_store::ObjectStore) with
+    ///   "/" pointing at the root of the object store.
+    /// * `location` - A url corresponding to the storage location of the delta table.
+    pub fn with_storage_backend(
+        mut self,
+        root_storage: Arc<DynObjectStore>,
+        location: Url,
+    ) -> Self {
+        self.storage_backend = Some((root_storage, location));
+        self
+    }
+
+    /// Set options used to initialize storage backend
+    ///
+    /// Options may be passed in the HashMap or set as environment variables. See documentation of
+    /// underlying object store implementation for details. Trailing slash will be trimmed in
+    /// the option's value to avoid failures. Trimming will only be done if one or more of below
+    /// conditions are met:
+    /// - key ends with `_URL` (e.g., `ENDPOINT_URL`, `S3_URL`, `JDBC_URL`, etc.)
+    /// - value starts with `http://`` or `https://` (e.g., `http://localhost:8000/`)
+    ///
+    /// - [Azure options](https://docs.rs/object_store/latest/object_store/azure/enum.AzureConfigKey.html#variants)
+    /// - [S3 options](https://docs.rs/object_store/latest/object_store/aws/enum.AmazonS3ConfigKey.html#variants)
+    /// - [Google options](https://docs.rs/object_store/latest/object_store/gcp/enum.GoogleConfigKey.html#variants)
+    pub fn with_storage_options(mut self, storage_options: HashMap<String, String>) -> Self {
+        self.storage_options = Some(
+            storage_options
+                .clone()
+                .into_iter()
+                .map(|(k, v)| {
+                    let needs_trim = v.starts_with("http://")
+                        || v.starts_with("https://")
+                        || k.to_lowercase().ends_with("_url");
+                    if needs_trim {
+                        (k.to_owned(), v.trim_end_matches('/').to_owned())
+                    } else {
+                        (k, v)
+                    }
+                })
+                .collect(),
+        );
+        self
+    }
+
+    /// Allows insecure connections via http.
+    ///
+    /// This setting is most useful for testing / development when connecting to emulated services.
+    pub fn with_allow_http(mut self, allow_http: bool) -> Self {
+        self.allow_http = Some(allow_http);
+        self
+    }
+
+    /// Provide a custom runtime handle or runtime config
+    pub fn with_io_runtime(mut self, io_runtime: IORuntime) -> Self {
+        self.io_runtime = Some(io_runtime);
+        self
+    }
+
+    /// Storage options for configuring backend object store
+    pub fn storage_options(&self) -> HashMap<String, String> {
+        let mut storage_options = self.storage_options.clone().unwrap_or_default();
+        if let Some(allow) = self.allow_http {
+            storage_options.insert(
+                "allow_http".into(),
+                if allow { "true" } else { "false" }.into(),
+            );
+        };
+        storage_options
+    }
+
+    /// Build a delta storage backend for the given config
+    pub fn build_storage(&self) -> DeltaResult<LogStoreRef> {
+        debug!("build_storage() with {}", self.table_url);
+
+        let mut storage_config = StorageConfig::parse_options(self.storage_options())?;
+        if let Some(io_runtime) = self.io_runtime.clone() {
+            storage_config = storage_config.with_io_runtime(io_runtime);
+        }
+
+        if let Some((store, _url)) = self.storage_backend.as_ref() {
+            debug!("Loading a logstore with a custom store: {store:?}");
+            crate::logstore::logstore_with(store.clone(), &self.table_url, storage_config)
+        } else {
+            // If there has been no backend defined just default to the normal logstore look up
+            debug!(
+                "Loading a logstore based off the location: {:?}",
+                self.table_url
+            );
+            crate::logstore::logstore_for(&self.table_url, storage_config)
+        }
+    }
+
+    /// Build the [`DeltaTable`] from specified options.
+    ///
+    /// This will not load the log, i.e. the table is not initialized. To get an initialized
+    /// table use the `load` function
+    pub fn build(self) -> DeltaResult<DeltaTable> {
+        Ok(DeltaTable::new(self.build_storage()?))
+    }
+
+    /// Build the [`DeltaTable`] and load its state
+    pub async fn load(self) -> DeltaResult<DeltaTable> {
+        let version = self.version;
+        let mut table = self.build()?;
+        match version {
+            DeltaVersion::Newest => table.load().await?,
+            DeltaVersion::Version(v) => table.load_version(v).await?,
+            DeltaVersion::Timestamp(ts) => table.load_with_datetime(ts).await?,
+        }
+        Ok(table)
+    }
+}
+
+enum UriType {
+    LocalPath(PathBuf),
+    Url(Url),
+}
+
+/// Expand tilde (~) in path to home directory
+fn expand_tilde_path(path: &str) -> DeltaResult<PathBuf> {
+    if path.starts_with("~/") || path == "~" {
+        let home_dir = dirs::home_dir().ok_or_else(|| {
+            DeltaTableError::InvalidTableLocation(
+                "Could not determine home directory for tilde expansion".to_string(),
+            )
+        })?;
+
+        if path == "~" {
+            Ok(home_dir)
+        } else {
+            let relative_path = &path[2..];
+            Ok(home_dir.join(relative_path))
+        }
+    } else {
+        Ok(PathBuf::from(path))
+    }
+}
+
+/// Utility function to figure out whether string representation of the path
+/// is either local path or some kind or URL.
+///
+/// Will return an error if the path is not valid.
+fn resolve_uri_type(table_uri: impl AsRef<str>) -> DeltaResult<UriType> {
+    let table_uri = table_uri.as_ref();
+    let known_schemes: Vec<_> = object_store_factories()
+        .iter()
+        .map(|v| v.key().scheme().to_owned())
+        .collect();
+
+    match Url::parse(table_uri) {
+        Ok(url) => {
+            let scheme = url.scheme().to_string();
+            if url.scheme() == "file" {
+                Ok(UriType::LocalPath(url.to_file_path().map_err(|err| {
+                    let msg = format!("Invalid table location: {table_uri}\nError: {err:?}");
+                    DeltaTableError::InvalidTableLocation(msg)
+                })?))
+            // NOTE this check is required to support absolute windows paths which may properly parse as url
+            } else if known_schemes.contains(&scheme) {
+                Ok(UriType::Url(url))
+            // NOTE this check is required to support absolute windows paths which may properly parse as url
+            // we assume here that a single character scheme is a windows drive letter
+            } else if scheme.len() == 1 {
+                Ok(UriType::LocalPath(expand_tilde_path(table_uri)?))
+            } else {
+                Err(DeltaTableError::InvalidTableLocation(format!(
+                    "Unknown scheme: {scheme}. Known schemes: {}",
+                    known_schemes.join(",")
+                )))
+            }
+        }
+        Err(url_error) => {
+            match url_error {
+                // The RelativeUrlWithoutBase error _usually_ means this function has been called
+                // with a file path looking thing.
+                url::ParseError::RelativeUrlWithoutBase => {
+                    Ok(UriType::LocalPath(expand_tilde_path(table_uri)?))
+                }
+                // All other parse errors are likely an actually broken URL that should not be
+                // interpreted as anything but
+                _others => Err(DeltaTableError::InvalidTableLocation(format!(
+                    "Could not parse {table_uri} as a URL: {url_error}"
+                ))),
+            }
+        }
+    }
+}
+
+/// Attempt to create a Url from given table location.
+///
+/// The location could be:
+///  * A valid URL, which will be parsed and returned
+///  * A path to a directory, which will be created and then converted to a URL.
+///
+/// Extra slashes will be removed from the end path as well.
+///
+/// Parse a table URI to a URL without creating directories.
+/// This is useful for opening existing tables where we don't want to create directories.
+pub fn parse_table_uri(table_uri: impl AsRef<str>) -> DeltaResult<Url> {
+    let table_uri = table_uri.as_ref();
+
+    let uri_type: UriType = resolve_uri_type(table_uri)?;
+
+    let mut url = match uri_type {
+        UriType::LocalPath(path) => {
+            let path = std::fs::canonicalize(&path).map_err(|err| {
+                let msg = format!(
+                    "Local path \"{}\" does not exist or you don't have access!\nError: {err:?}",
+                    path.display(),
+                );
+                DeltaTableError::InvalidTableLocation(msg)
+            })?;
+            Url::from_directory_path(path).map_err(|_| {
+                let msg = format!(
+                    "Could not construct a URL from the canonical path: {table_uri}.\n\
+                    Something must be very wrong with the table path.",
+                );
+                DeltaTableError::InvalidTableLocation(msg)
+            })?
+        }
+        UriType::Url(url) => url,
+    };
+
+    let trimmed_path = url.path().trim_end_matches('/').to_owned();
+    url.set_path(&trimmed_path);
+    Ok(url)
+}
+
+/// Will return an error if the location is not valid. For example,
+/// Creates directories for local paths if they don't exist.
+pub fn ensure_table_uri(table_uri: impl AsRef<str>) -> DeltaResult<Url> {
+    let table_uri = table_uri.as_ref();
+
+    let uri_type: UriType = resolve_uri_type(table_uri)?;
+
+    // If it is a local path, we need to create it if it does not exist.
+    let url = match uri_type {
+        UriType::LocalPath(path) => {
+            if !path.exists() {
+                std::fs::create_dir_all(&path).map_err(|err| {
+                    let msg =
+                        format!("Could not create local directory: {table_uri}\nError: {err:?}");
+                    DeltaTableError::InvalidTableLocation(msg)
+                })?;
+            }
+            let path = std::fs::canonicalize(path).map_err(|err| {
+                let msg = format!("Invalid table location: {table_uri}\nError: {err:?}");
+                DeltaTableError::InvalidTableLocation(msg)
+            })?;
+            Url::from_directory_path(path).map_err(|_| {
+                let msg = format!(
+                    "Could not construct a URL from the canonical path: {table_uri}.\n\
+                    Something must be very wrong with the table path.",
+                );
+                DeltaTableError::InvalidTableLocation(msg)
+            })?
+        }
+        UriType::Url(url) => url,
+    };
+
+    // We should always be normalizing the table URL because trailing or redundant slashes can be
+    // load bearing with [Url] and this helps ensure that a [Url] always meets our internal
+    // expectations of path segments and join-ability.
+    Ok(normalize_table_url(&url))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::logstore::factories::DefaultObjectStoreFactory;
+
+    #[test]
+    fn test_ensure_table_uri() {
+        object_store_factories().insert(
+            Url::parse("s3://").unwrap(),
+            Arc::new(DefaultObjectStoreFactory::default()),
+        );
+
+        // parse an existing relative directory
+        let uri = ensure_table_uri(".");
+        assert!(uri.is_ok());
+        let uri = ensure_table_uri("s3://container/path");
+        assert!(uri.is_ok());
+        assert_eq!(Url::parse("s3://container/path/").unwrap(), uri.unwrap());
+        #[cfg(not(windows))]
+        {
+            let uri = ensure_table_uri("file:///tmp/nonexistent/some/path");
+            assert!(uri.is_ok());
+        }
+        let uri = ensure_table_uri("./nonexistent");
+        assert!(uri.is_ok());
+        let file_path = std::path::Path::new("./nonexistent");
+        std::fs::remove_dir(file_path).unwrap();
+
+        // These cases should all roundtrip to themselves
+        cfg_if::cfg_if! {
+            if #[cfg(windows)] {
+                let roundtrip_cases = &[
+                    "s3://tests/data/delta-0.8.0/",
+                    "memory://",
+                    "s3://bucket/my%20table/", // Doesn't double-encode
+                ];
+            } else {
+                let roundtrip_cases = &[
+                    "s3://tests/data/delta-0.8.0/",
+                    "memory://",
+                    "file:///",
+                    "s3://bucket/my%20table/", // Doesn't double-encode
+                ];
+            }
+        }
+
+        for case in roundtrip_cases {
+            let uri = ensure_table_uri(case).unwrap();
+            assert_eq!(case, &uri.as_str());
+        }
+
+        // Other cases
+        let map_cases = &[
+            // extra slashes are removed
+            (
+                "s3://tests/data/delta-0.8.0//",
+                "s3://tests/data/delta-0.8.0/",
+            ),
+            ("s3://bucket/my table", "s3://bucket/my%20table/"),
+        ];
+
+        for (case, expected) in map_cases {
+            let uri = ensure_table_uri(case).unwrap();
+            assert_eq!(expected, &uri.as_str());
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn test_windows_uri() {
+        let map_cases = &[
+            // extra slashes are removed
+            ("c://", "file:///C:/"),
+        ];
+
+        for (case, expected) in map_cases {
+            let uri = ensure_table_uri(case).unwrap();
+            assert_eq!(expected, &uri.as_str());
+        }
+    }
+
+    #[test]
+    fn test_ensure_table_uri_path() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let tmp_path = std::fs::canonicalize(tmp_dir.path()).unwrap();
+        let paths = &[
+            tmp_path.join("data/delta-0.8.0"),
+            tmp_path.join("space in path"),
+            tmp_path.join("special&chars/你好/😊"),
+        ];
+
+        for path in paths {
+            let expected = Url::from_directory_path(path).unwrap();
+            let uri = ensure_table_uri(path.as_os_str().to_str().unwrap()).unwrap();
+            assert_eq!(expected.as_str(), uri.as_str());
+            assert!(path.exists());
+        }
+
+        // Creates non-existent relative directories
+        let relative_path = std::path::Path::new("_tmp/test %3F");
+        assert!(!relative_path.exists());
+        ensure_table_uri(relative_path.as_os_str().to_str().unwrap()).unwrap();
+        assert!(relative_path.exists());
+        std::fs::remove_dir_all(std::path::Path::new("_tmp")).unwrap();
+    }
+
+    #[test]
+    fn test_ensure_table_uri_url() {
+        // Urls should round trips as-is
+        let expected = Url::parse("memory:///test/tests/data/delta-0.8.0/").unwrap();
+        let url = ensure_table_uri(&expected).unwrap();
+        assert_eq!(expected, url);
+
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let tmp_path = std::fs::canonicalize(tmp_dir.path()).unwrap();
+        let path = tmp_path.join("data/delta-0.8.0");
+        let expected = Url::from_directory_path(path).unwrap();
+        let url = ensure_table_uri(&expected).unwrap();
+        assert_eq!(expected.as_str(), url.as_str());
+    }
+
+    #[test]
+    fn test_writer_storage_opts_url_trim() {
+        let cases = [
+            // Trim Case 1 - Key indicating a url
+            ("SOMETHING_URL", "something://else/", "something://else"),
+            // Trim Case 2 - Value https url ending with slash
+            (
+                "SOMETHING",
+                "http://something:port/",
+                "http://something:port",
+            ),
+            // Trim Case 3 - Value https url ending with slash
+            (
+                "SOMETHING",
+                "https://something:port/",
+                "https://something:port",
+            ),
+            // No Trim Case 4 - JDBC MySQL url with slash
+            (
+                "SOME_JDBC_PREFIX",
+                "jdbc:mysql://mysql.db.server:3306/",
+                "jdbc:mysql://mysql.db.server:3306/",
+            ),
+            // No Trim Case 5 - S3A file system link
+            ("SOME_S3_LINK", "s3a://bucket-name/", "s3a://bucket-name/"),
+            // No Trim Case 6 - Not a url but ending with slash
+            ("SOME_RANDOM_STRING", "a1b2c3d4e5f#/", "a1b2c3d4e5f#/"),
+            // No Trim Case 7 - Some value not a url
+            (
+                "SOME_VALUE",
+                "/ This is some value 123 /",
+                "/ This is some value 123 /",
+            ),
+        ];
+        for (key, val, expected) in cases {
+            let table_uri = Url::parse("memory:///test/tests/data/delta-0.8.0").unwrap();
+            let mut storage_opts = HashMap::<String, String>::new();
+            storage_opts.insert(key.to_owned(), val.to_owned());
+
+            let table = DeltaTableBuilder::from_url(table_uri)
+                .unwrap()
+                .with_storage_options(storage_opts);
+            let found_opts = table.storage_options();
+            assert_eq!(expected, found_opts.get(key).unwrap());
+        }
+    }
+
+    #[test]
+    fn test_expand_tilde_path() {
+        let home_dir = dirs::home_dir().expect("Should have home directory");
+
+        let result = expand_tilde_path("~").unwrap();
+        assert_eq!(result, home_dir);
+
+        let result = expand_tilde_path("~/test/path").unwrap();
+        assert_eq!(result, home_dir.join("test/path"));
+
+        let result = expand_tilde_path("/absolute/path").unwrap();
+        assert_eq!(result, PathBuf::from("/absolute/path"));
+
+        let result = expand_tilde_path("relative/path").unwrap();
+        assert_eq!(result, PathBuf::from("relative/path"));
+
+        let result = expand_tilde_path("~other").unwrap();
+        assert_eq!(result, PathBuf::from("~other"));
+    }
+
+    #[test]
+    fn test_resolve_uri_type_with_tilde() {
+        let home_dir = dirs::home_dir().expect("Should have home directory");
+
+        match resolve_uri_type("~/test/path").unwrap() {
+            UriType::LocalPath(path) => {
+                assert_eq!(path, home_dir.join("test/path"));
+            }
+            _ => panic!("Expected LocalPath"),
+        }
+
+        match resolve_uri_type("~").unwrap() {
+            UriType::LocalPath(path) => {
+                assert_eq!(path, home_dir);
+            }
+            _ => panic!("Expected LocalPath"),
+        }
+
+        match resolve_uri_type("regular/path").unwrap() {
+            UriType::LocalPath(path) => {
+                assert_eq!(path, PathBuf::from("regular/path"));
+            }
+            _ => panic!("Expected LocalPath"),
+        }
+    }
+
+    #[test]
+    fn test_invalid_url_but_invalid_file_path_too() -> DeltaResult<()> {
+        for wrong in &["s3://arn:aws:s3:::something", "hdfs://"] {
+            let result = ensure_table_uri(wrong);
+            assert!(
+                result.is_err(),
+                "Expected {wrong} parsed into {result:#?} to return an error because I gave it something URLish"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_ensure_table_uri_with_tilde() {
+        let home_dir = dirs::home_dir().expect("Should have home directory");
+
+        let test_dir = home_dir.join("delta_test_temp");
+        std::fs::create_dir_all(&test_dir).ok();
+
+        let tilde_path = "~/delta_test_temp";
+        let result = ensure_table_uri(tilde_path);
+        assert!(
+            result.is_ok(),
+            "ensure_table_uri should work with tilde paths"
+        );
+
+        let url = result.unwrap();
+        assert!(!url.as_str().contains("~"));
+
+        #[cfg(windows)]
+        {
+            let home_dir_normalized = home_dir.to_string_lossy().replace('\\', "/");
+            assert!(url.as_str().contains(&home_dir_normalized));
+        }
+
+        #[cfg(not(windows))]
+        {
+            assert!(url.as_str().contains(home_dir.to_string_lossy().as_ref()));
+        }
+
+        std::fs::remove_dir_all(&test_dir).ok();
+    }
+
+    #[test]
+    fn test_parse_table_uri_remote_url() {
+        object_store_factories().insert(
+            Url::parse("s3://").unwrap(),
+            Arc::new(DefaultObjectStoreFactory::default()),
+        );
+
+        // Basic remote URL is returned as-is
+        let uri = parse_table_uri("s3://bucket/path");
+        assert!(uri.is_ok());
+        assert_eq!("s3://bucket/path", uri.unwrap().as_str());
+
+        // Trailing slashes are trimmed from the path component
+        let uri = parse_table_uri("s3://bucket/path/");
+        assert!(uri.is_ok());
+        assert_eq!("s3://bucket/path", uri.unwrap().as_str());
+
+        // Multiple trailing slashes are all trimmed
+        let uri = parse_table_uri("s3://bucket/path//");
+        assert!(uri.is_ok());
+        assert_eq!("s3://bucket/path", uri.unwrap().as_str());
+
+        // memory:// scheme is supported
+        let uri = parse_table_uri("memory:///test/table");
+        assert!(uri.is_ok());
+        assert_eq!("memory:///test/table", uri.unwrap().as_str());
+
+        // Percent-encoded paths are preserved (no double-encoding)
+        let uri = parse_table_uri("s3://bucket/my%20table");
+        assert!(uri.is_ok());
+        assert_eq!("s3://bucket/my%20table", uri.unwrap().as_str());
+    }
+
+    #[test]
+    fn test_parse_table_uri_local_existing_path() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let tmp_path = std::fs::canonicalize(tmp_dir.path()).unwrap();
+
+        // Existing absolute path returns a file:// URL
+        let uri = parse_table_uri(tmp_path.to_str().unwrap());
+        assert!(uri.is_ok());
+        let url = uri.unwrap();
+        assert!(url.scheme() == "file");
+        // Path should not have a trailing slash after parse_table_uri
+        assert!(!url.path().ends_with('/'));
+
+        // Existing path via file:// URL round-trips correctly
+        let file_url = Url::from_directory_path(&tmp_path).unwrap();
+        let uri = parse_table_uri(file_url.as_str());
+        assert!(uri.is_ok());
+        let parsed_path = uri.unwrap().to_file_path().unwrap();
+        assert_eq!(tmp_path, std::fs::canonicalize(parsed_path).unwrap());
+    }
+
+    #[test]
+    fn test_parse_table_uri_local_nonexistent_path_fails() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let tmp_path = std::fs::canonicalize(tmp_dir.path()).unwrap();
+        let nonexistent = tmp_path.join("does_not_exist");
+
+        // parse_table_uri does NOT create directories, so a non-existent local
+        // path must return an error (canonicalize fails).
+        let uri = parse_table_uri(nonexistent.to_str().unwrap());
+        assert!(
+            uri.is_err(),
+            "parse_table_uri should fail for non-existent local paths"
+        );
+    }
+
+    #[test]
+    fn test_parse_table_uri_current_dir() {
+        // "." resolves to the current working directory, which always exists
+        let uri = parse_table_uri(".");
+        assert!(uri.is_ok());
+        let url = uri.unwrap();
+        assert_eq!(url.scheme(), "file");
+    }
+
+    #[test]
+    fn test_parse_table_uri_invalid_scheme() {
+        // Unknown multi-character schemes should return an error
+        let uri = parse_table_uri("hdfs://namenode/path");
+        assert!(
+            uri.is_err(),
+            "parse_table_uri should fail for unknown schemes"
+        );
+    }
+
+    #[test]
+    fn test_create_builder_from_non_existent_path() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let tmp_path = std::fs::canonicalize(tmp_dir.path()).unwrap();
+        let new_path = tmp_path.join("new_table");
+        assert!(!new_path.exists());
+
+        let builder_result =
+            DeltaTableBuilder::from_url(Url::from_directory_path(&new_path).unwrap());
+        assert!(
+            builder_result.is_ok(),
+            "Builder should be created successfully even if the path does not exist"
+        );
+
+        let builder = builder_result.unwrap();
+        assert_eq!(
+            builder.table_url.as_str(),
+            Url::from_directory_path(&new_path).unwrap().as_str()
+        );
+    }
+}

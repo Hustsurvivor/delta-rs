@@ -1,0 +1,836 @@
+//! Main writer API to write json messages to delta table
+use std::collections::HashMap;
+use std::num::NonZeroU64;
+use std::sync::Arc;
+
+use arrow::datatypes::SchemaRef as ArrowSchemaRef;
+use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
+use delta_kernel::table_properties::DataSkippingNumIndexedCols;
+use itertools::Itertools;
+use serde_json::Value;
+use tracing::*;
+use url::Url;
+
+use super::utils::record_batch_from_message;
+use super::window::{SinkFactory, WriteWindow};
+use super::{DeltaWriter, DeltaWriterError, WriteMode, ensure_legacy_writer_supports_table};
+use crate::DeltaTable;
+use crate::datafile::{DeltaWriterProperties, WriterStatsConfig};
+use crate::errors::DeltaTableError;
+use crate::kernel::Add;
+use crate::table::builder::DeltaTableBuilder;
+use crate::table::config::TablePropertiesExt as _;
+
+/// Writes messages to a delta lake table.
+///
+/// Batches are streamed to storage as they are written, and a flush window
+/// commits all-or-nothing: if any write returns an error — including a
+/// transient IO error from the object store — every batch buffered since the
+/// last flush is discarded along with the failing one, and the caller must
+/// re-write all of them. (Validation errors caught before the data reaches
+/// storage fail only that call and leave the window untouched. A write with
+/// malformed JSON records rejects the whole call and writes nothing.)
+pub struct JsonWriter {
+    /// All mutable per-flush-window state. The schema is fixed at construction
+    /// (from the provided schema ref, or the table's schema). `JsonWriter` never
+    /// evolves the schema, so the window never widens.
+    window: WriteWindow,
+}
+
+impl std::fmt::Debug for JsonWriter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "JsonWriter")
+    }
+}
+
+impl JsonWriter {
+    /// Create a new JsonWriter instance
+    pub async fn try_new(
+        table_url: Url,
+        schema_ref: ArrowSchemaRef,
+        partition_columns: Option<Vec<String>>,
+        storage_options: Option<HashMap<String, String>>,
+    ) -> Result<Self, DeltaTableError> {
+        let table = DeltaTableBuilder::from_url(table_url)?
+            .with_storage_options(storage_options.unwrap_or_default())
+            .load()
+            .await?;
+        ensure_legacy_writer_supports_table(&table, "JsonWriter")?;
+        Self::from_parts(&table, schema_ref, partition_columns.unwrap_or_default())
+    }
+
+    /// Creates a JsonWriter to write to the given table, using the table's schema.
+    pub fn for_table(table: &DeltaTable) -> Result<JsonWriter, DeltaTableError> {
+        ensure_legacy_writer_supports_table(table, "JsonWriter")?;
+        let (schema, partition_columns) = {
+            let snapshot = table.snapshot()?;
+            let partition_columns = snapshot.metadata().partition_columns().to_vec();
+            let schema: ArrowSchemaRef = Arc::new(snapshot.schema().as_ref().try_into_arrow()?);
+            (schema, partition_columns)
+        };
+        Self::from_parts(table, schema, partition_columns)
+    }
+
+    /// Build a writer over `table` with a fixed `schema` and partitioning. The
+    /// stats configuration is resolved once here (mirroring `RecordBatchWriter`).
+    fn from_parts(
+        table: &DeltaTable,
+        schema: ArrowSchemaRef,
+        partition_columns: Vec<String>,
+    ) -> Result<Self, DeltaTableError> {
+        let (num_indexed_cols, stats_columns) = Self::read_stats_config(table)?;
+        let factory = SinkFactory {
+            storage: table.object_store(),
+            partition_columns,
+            props: DeltaWriterProperties::default()
+                .with_stats_config(WriterStatsConfig::new(num_indexed_cols, stats_columns)),
+        };
+        Ok(Self {
+            window: WriteWindow::new(factory, schema),
+        })
+    }
+
+    /// Resolve the data-skipping stats configuration from the table snapshot.
+    fn read_stats_config(
+        table: &DeltaTable,
+    ) -> Result<(DataSkippingNumIndexedCols, Option<Vec<String>>), DeltaTableError> {
+        let snapshot = table.snapshot()?;
+        let table_config = snapshot.table_config();
+        Ok((
+            table_config.num_indexed_cols(),
+            table_config
+                .data_skipping_stats_columns
+                .as_ref()
+                .map(|cols| cols.iter().map(|c| c.to_string()).collect_vec()),
+        ))
+    }
+
+    /// Approximate encoded (parquet) size written since the last flush,
+    /// including files already finalized by a size roll. Monotonic within a
+    /// flush window, so usable as a threshold for calling [`flush`](Self::flush).
+    pub fn buffer_len(&self) -> usize {
+        self.window.buffered_size()
+    }
+
+    /// Returns the number of record batches streamed since the last flush.
+    pub fn buffered_record_batch_count(&self) -> usize {
+        self.window.count()
+    }
+
+    /// Resets internal state, discarding any data written since the last flush.
+    ///
+    /// The sink streams to storage as it writes: open files' in-progress
+    /// multipart uploads are aborted in the background, while files already
+    /// finalized by a size roll are left unreferenced for a later vacuum. Call
+    /// [`flush`](Self::flush) instead to commit buffered data.
+    pub fn reset(&mut self) {
+        self.window.abort();
+    }
+
+    /// Sets a target file size; once an in-progress file reaches it the writer
+    /// finalizes it and rolls a new one. Without this the writer emits a single
+    /// file per partition per flush (the default).
+    ///
+    /// A `target_file_size` of `0` means "no limit": size-based rolling is
+    /// disabled and the writer keeps one file per partition per flush, exactly
+    /// as if this method had not been called.
+    pub fn with_target_file_size(mut self, target_file_size: u64) -> Self {
+        self.window
+            .set_target_file_size(NonZeroU64::new(target_file_size));
+        self
+    }
+
+    /// Returns the arrow schema this writer encodes under (fixed at construction).
+    pub fn arrow_schema(&self) -> ArrowSchemaRef {
+        self.window.schema().clone()
+    }
+}
+
+/// Turn a batch decode failure into a [`DeltaTableError::InvalidData`] naming the
+/// offending records: re-decode each record individually (JSON decode only — no
+/// parquet, and only on this error path) and report the failures by input index.
+/// The scan stops once the preview is full — identification is diagnostic, so a
+/// mostly-bad bulk write must not pay a full second decode pass. Falls back to
+/// the original error if every scanned record decodes on its own.
+fn invalid_records_error(
+    schema: &ArrowSchemaRef,
+    values: &[Value],
+    batch_error: DeltaTableError,
+) -> DeltaTableError {
+    let mut bad: Vec<(usize, DeltaTableError)> = Vec::new();
+    let mut scanned = 0usize;
+    for (idx, value) in values.iter().enumerate() {
+        scanned = idx + 1;
+        if let Err(e) = record_batch_from_message(schema.clone(), std::slice::from_ref(value)) {
+            bad.push((idx, e));
+            if bad.len() >= super::INVALID_PREVIEW_CAP {
+                break;
+            }
+        }
+    }
+    if bad.is_empty() {
+        return batch_error;
+    }
+    let preview = bad
+        .iter()
+        .map(|(idx, e)| format!("{idx}: {e}"))
+        .collect::<Vec<_>>()
+        .join("; ");
+    let count = if scanned < values.len() {
+        format!("at least {}", bad.len())
+    } else {
+        bad.len().to_string()
+    };
+    DeltaTableError::InvalidData {
+        message: format!(
+            "{count} of {} records failed validation; offending records by input index: {preview}",
+            values.len(),
+        ),
+    }
+}
+
+#[async_trait::async_trait]
+impl DeltaWriter<Vec<Value>> for JsonWriter {
+    /// Write a chunk of values into the internal write buffers with the default write mode
+    async fn write(&mut self, values: Vec<Value>) -> Result<(), DeltaTableError> {
+        self.write_with_mode(values, WriteMode::Default).await
+    }
+
+    /// Decode the JSON values into a record batch and stream it into the dataset
+    /// writer; partitioning and parquet encoding happen incrementally, and files
+    /// are finalized at flush.
+    ///
+    /// JSON decode and validation errors (wrong types, nulls in non-nullable
+    /// columns) are reported here, per write, as [`DeltaTableError::InvalidData`]
+    /// naming the offending records by input index, and leave the flush window
+    /// untouched — drop or fix those records and retry the write. Parquet-encoding
+    /// / object-store errors can surface here (encoding is incremental) or later at
+    /// [`flush`](JsonWriter::flush); those fail the whole flush window — every
+    /// batch since the last flush.
+    async fn write_with_mode(
+        &mut self,
+        values: Vec<Value>,
+        mode: WriteMode,
+    ) -> Result<(), DeltaTableError> {
+        if mode != WriteMode::Default {
+            warn!(
+                "The JsonWriter does not currently support non-default write modes, falling back to default mode"
+            );
+        }
+        // An empty write is a no-op (the JSON decoder yields no batch for `[]`).
+        if values.is_empty() {
+            return Ok(());
+        }
+        // Reject non-object records up front with a clear error, rather than an
+        // opaque arrow JSON-decoder failure.
+        if let Some(value) = values.iter().find(|v| !v.is_object()) {
+            return Err(DeltaWriterError::InvalidRecord(value.to_string()).into());
+        }
+        let schema = self.window.schema().clone();
+        let record_batch = match record_batch_from_message(schema.clone(), values.as_slice()) {
+            Ok(batch) => batch,
+            Err(err) => return Err(invalid_records_error(&schema, &values, err)),
+        };
+
+        if record_batch.schema() != schema {
+            return Err(DeltaWriterError::SchemaMismatch {
+                record_batch_schema: record_batch.schema(),
+                expected_schema: schema,
+            }
+            .into());
+        }
+
+        // `JsonWriter` never evolves the schema, so the window never widens.
+        self.window.write(&record_batch, None).await
+    }
+
+    /// Finalize all files written since the last flush and return their [`Add`]
+    /// actions, resetting internal state to handle another flush window.
+    ///
+    /// These actions should be committed to the [DeltaTable] for the written data.
+    #[instrument(skip(self), fields(batch_count = 0))]
+    async fn flush(&mut self) -> Result<Vec<Add>, DeltaTableError> {
+        Span::current().record("batch_count", self.window.count());
+        let actions = self.window.drain().await?;
+        debug!(actions_count = actions.len(), "flush completed");
+        Ok(actions)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use arrow::datatypes::Schema as ArrowSchema;
+    use arrow::record_batch::RecordBatch;
+    use delta_kernel::expressions::Scalar;
+    use indexmap::IndexMap;
+
+    use crate::kernel::scalars::ScalarExt;
+
+    #[cfg(feature = "datafusion")]
+    use futures::TryStreamExt;
+    use parquet::file::reader::FileReader;
+    use parquet::file::serialized_reader::SerializedFileReader;
+    use std::fs::File;
+
+    use crate::arrow::array::Int32Array;
+    use crate::arrow::datatypes::{DataType as ArrowDataType, Field as ArrowField};
+    use crate::operations::create::CreateBuilder;
+    use crate::writer::test_utils::get_delta_schema;
+
+    /// Extract partition scalar values from a record batch.
+    fn extract_partition_values(
+        partition_cols: &[String],
+        record_batch: &RecordBatch,
+    ) -> Result<IndexMap<String, Scalar>, DeltaWriterError> {
+        let mut partition_values = IndexMap::new();
+
+        for col_name in partition_cols.iter() {
+            let arrow_schema = record_batch.schema();
+            let i = arrow_schema.index_of(col_name)?;
+            let col = record_batch.column(i);
+            let value = Scalar::from_array(col.as_ref(), 0)
+                .ok_or(DeltaWriterError::MissingPartitionColumn(col_name.clone()))?;
+
+            partition_values.insert(col_name.clone(), value);
+        }
+
+        Ok(partition_values)
+    }
+
+    /// Generate a simple test table which has been pre-created at version 0
+    async fn get_test_table(table_dir: &tempfile::TempDir) -> DeltaTable {
+        let schema = get_delta_schema();
+        let path = table_dir.path().to_str().unwrap().to_string();
+
+        let mut table = CreateBuilder::new()
+            .with_location(&path)
+            .with_table_name("test-table")
+            .with_comment("A table for running tests")
+            .with_columns(schema.fields().cloned())
+            .await
+            .unwrap();
+        table.load().await.expect("Failed to load table");
+        assert_eq!(table.version(), Some(0));
+        table
+    }
+
+    #[tokio::test]
+    async fn test_json_write_empty_is_noop() {
+        let table_dir = tempfile::tempdir().unwrap();
+        let table = get_test_table(&table_dir).await;
+        let mut writer = JsonWriter::for_table(&table).unwrap();
+
+        // An empty write must be a no-op (not an error), and produce no files.
+        writer.write(vec![]).await.unwrap();
+        assert_eq!(writer.buffered_record_batch_count(), 0);
+        let add_actions = writer.flush().await.unwrap();
+        assert!(add_actions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_json_write_rejects_non_object_record() {
+        let table_dir = tempfile::tempdir().unwrap();
+        let table = get_test_table(&table_dir).await;
+        let mut writer = JsonWriter::for_table(&table).unwrap();
+
+        // A bare (non-object) JSON value must be rejected up front with a clear,
+        // record-naming error rather than an opaque arrow decode failure.
+        let err = writer
+            .write(vec![serde_json::json!(42)])
+            .await
+            .expect_err("a non-object JSON record must be rejected");
+        assert!(
+            err.to_string().contains("Invalid JSON record"),
+            "got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_partition_not_written_to_parquet() {
+        let table_dir = tempfile::tempdir().unwrap();
+        let table = get_test_table(&table_dir).await;
+        let arrow_schema = table.snapshot().unwrap().snapshot().arrow_schema();
+        let mut writer = JsonWriter::try_new(
+            table.table_url().clone(),
+            arrow_schema,
+            Some(vec!["modified".to_string()]),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let data = serde_json::json!(
+            {
+                "id" : "A",
+                "value": 42,
+                "modified": "2021-02-01"
+            }
+        );
+
+        writer.write(vec![data]).await.unwrap();
+        let add_actions = writer.flush().await.unwrap();
+        let add = &add_actions[0];
+        let path = table_dir.path().join(&add.path);
+
+        let file = File::open(path.as_path()).unwrap();
+        let reader = SerializedFileReader::new(file).unwrap();
+
+        let metadata = reader.metadata();
+        let schema_desc = metadata.file_metadata().schema_descr();
+
+        let columns = schema_desc
+            .columns()
+            .iter()
+            .map(|desc| desc.name().to_string())
+            .collect::<Vec<String>>();
+        assert_eq!(columns, vec!["id".to_string(), "value".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn test_json_writer_for_table_defaults_include_delta_rs_created_by() {
+        let table_dir = tempfile::tempdir().unwrap();
+        let table = get_test_table(&table_dir).await;
+
+        let writer = JsonWriter::for_table(&table).unwrap();
+
+        assert_eq!(
+            writer.window.writer_properties().created_by(),
+            format!("delta-rs version {}", crate::crate_version())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_json_writer_try_new_defaults_include_delta_rs_created_by() {
+        let table_dir = tempfile::tempdir().unwrap();
+        let table = get_test_table(&table_dir).await;
+        let arrow_schema = table.snapshot().unwrap().snapshot().arrow_schema();
+
+        let writer = JsonWriter::try_new(
+            table.table_url().clone(),
+            arrow_schema,
+            Some(vec!["modified".to_string()]),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            writer.window.writer_properties().created_by(),
+            format!("delta-rs version {}", crate::crate_version())
+        );
+    }
+
+    #[test]
+    fn test_extract_partition_values() {
+        let record_batch = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![
+                ArrowField::new("col1", ArrowDataType::Int32, false),
+                ArrowField::new("col2", ArrowDataType::Int32, false),
+                ArrowField::new("col3", ArrowDataType::Int32, true),
+            ])),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2])),
+                Arc::new(Int32Array::from(vec![2, 1])),
+                Arc::new(Int32Array::from(vec![None, None])),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(
+            extract_partition_values(
+                &[String::from("col1"), String::from("col2"),],
+                &record_batch
+            )
+            .unwrap(),
+            IndexMap::from([
+                (String::from("col1"), Scalar::Integer(1)),
+                (String::from("col2"), Scalar::Integer(2)),
+            ])
+        );
+        assert_eq!(
+            extract_partition_values(&[String::from("col1")], &record_batch).unwrap(),
+            IndexMap::from([(String::from("col1"), Scalar::Integer(1)),])
+        );
+        assert!(extract_partition_values(&[String::from("col4")], &record_batch).is_err())
+    }
+
+    #[tokio::test]
+    async fn test_parsing_error() {
+        let table_dir = tempfile::tempdir().unwrap();
+        let table = get_test_table(&table_dir).await;
+
+        let arrow_schema = table.snapshot().unwrap().snapshot().arrow_schema();
+        let mut writer = JsonWriter::try_new(
+            table.table_url().clone(),
+            arrow_schema,
+            Some(vec!["modified".to_string()]),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let data = serde_json::json!(
+            {
+                "id" : "A",
+                "value": "abc",
+                "modified": "2021-02-01"
+            }
+        );
+
+        // A record that fails to decode is reported as InvalidData naming its
+        // input index, not as an opaque arrow error.
+        let err = writer.write(vec![data]).await.unwrap_err();
+        match &err {
+            DeltaTableError::InvalidData { message } => {
+                assert!(message.contains("1 of 1 records"), "got: {message}");
+                assert!(message.contains("0:"), "got: {message}");
+            }
+            other => panic!("expected InvalidData, got: {other:?}"),
+        }
+    }
+
+    /// Create a table whose `id` column is non-nullable.
+    async fn get_table_with_non_nullable_id(table_dir: &tempfile::TempDir) -> DeltaTable {
+        use crate::kernel::{DataType as DeltaDataType, PrimitiveType, StructField, StructType};
+        let schema = StructType::try_new(vec![
+            StructField::new(
+                "id".to_string(),
+                DeltaDataType::Primitive(PrimitiveType::String),
+                false,
+            ),
+            StructField::new(
+                "value".to_string(),
+                DeltaDataType::Primitive(PrimitiveType::Integer),
+                true,
+            ),
+        ])
+        .unwrap();
+        CreateBuilder::new()
+            .with_location(table_dir.path().to_str().unwrap())
+            .with_columns(schema.fields().cloned())
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_json_write_names_invalid_records_and_preserves_window() {
+        let table_dir = tempfile::tempdir().unwrap();
+        let table = get_table_with_non_nullable_id(&table_dir).await;
+        let mut writer = JsonWriter::for_table(&table).unwrap();
+
+        writer
+            .write(vec![serde_json::json!({"id": "good", "value": 1})])
+            .await
+            .unwrap();
+
+        // Record 1 is missing the non-nullable `id`; the whole call is rejected
+        // and the error names it by input index.
+        let records = vec![
+            serde_json::json!({"id": "a", "value": 2}),
+            serde_json::json!({"value": 3}),
+            serde_json::json!({"id": "c", "value": 4}),
+        ];
+        let err = writer.write(records).await.unwrap_err();
+        match &err {
+            DeltaTableError::InvalidData { message } => {
+                assert!(message.contains("1 of 3 records"), "got: {message}");
+                assert!(message.contains("1:"), "got: {message}");
+                assert!(message.contains("id"), "got: {message}");
+            }
+            other => panic!("expected InvalidData, got: {other:?}"),
+        }
+
+        // The failed call left the window untouched: the earlier good batch
+        // still flushes on its own.
+        let adds = writer.flush().await.unwrap();
+        assert_eq!(adds.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_json_write_invalid_records_preview_is_capped() {
+        let table_dir = tempfile::tempdir().unwrap();
+        let table = get_table_with_non_nullable_id(&table_dir).await;
+        let mut writer = JsonWriter::for_table(&table).unwrap();
+
+        // 12 bad records: the preview shows the first 10 and counts the rest.
+        let records: Vec<_> = (0..12).map(|i| serde_json::json!({"value": i})).collect();
+        let err = writer.write(records).await.unwrap_err();
+        match &err {
+            DeltaTableError::InvalidData { message } => {
+                // The scan stops once the preview is full (10 of the 12), so the
+                // count is a lower bound rather than an exact total.
+                assert!(
+                    message.contains("at least 10 of 12 records"),
+                    "got: {message}"
+                );
+            }
+            other => panic!("expected InvalidData, got: {other:?}"),
+        }
+    }
+
+    // The following sets of tests are related to #1386 and mergeSchema support
+    // <https://github.com/delta-io/delta-rs/issues/1386>
+    mod schema_evolution {
+        use super::*;
+
+        #[tokio::test]
+        async fn test_json_write_mismatched_values() {
+            let table_dir = tempfile::tempdir().unwrap();
+            let table = get_test_table(&table_dir).await;
+
+            let arrow_schema = table.snapshot().unwrap().snapshot().arrow_schema();
+            let mut writer = JsonWriter::try_new(
+                Url::from_directory_path(table_dir.path()).unwrap(),
+                arrow_schema,
+                Some(vec!["modified".to_string()]),
+                None,
+            )
+            .await
+            .unwrap();
+
+            let data = serde_json::json!(
+                {
+                    "id" : "A",
+                    "value": 42,
+                    "modified": "2021-02-01"
+                }
+            );
+
+            writer.write(vec![data]).await.unwrap();
+            let add_actions = writer.flush().await.unwrap();
+            assert_eq!(add_actions.len(), 1);
+
+            let second_data = serde_json::json!(
+                {
+                    "id" : 1,
+                    "name" : "Ion"
+                }
+            );
+
+            if writer.write(vec![second_data]).await.is_ok() {
+                panic!("Should not have successfully written");
+            }
+        }
+
+        #[cfg(feature = "datafusion")]
+        #[tokio::test]
+        async fn test_json_write_mismatched_schema() {
+            let table_dir = tempfile::tempdir().unwrap();
+            let mut table = get_test_table(&table_dir).await;
+
+            let mut writer = JsonWriter::try_new(
+                table.table_url().clone(),
+                table.snapshot().unwrap().snapshot().arrow_schema(),
+                Some(vec!["modified".to_string()]),
+                None,
+            )
+            .await
+            .unwrap();
+
+            let data = serde_json::json!(
+                {
+                    "id" : "A",
+                    "value": 42,
+                    "modified": "2021-02-01"
+                }
+            );
+
+            writer.write(vec![data]).await.unwrap();
+            let add_actions = writer.flush().await.unwrap();
+            assert_eq!(add_actions.len(), 1);
+
+            let second_data = serde_json::json!(
+                {
+                    "postcode" : 1,
+                    "name" : "Ion"
+                }
+            );
+
+            // TODO This should fail because we haven't asked to evolve the schema
+            writer.write(vec![second_data]).await.unwrap();
+            writer.flush_and_commit(&mut table).await.unwrap();
+            assert_eq!(table.version(), Some(1));
+        }
+    }
+
+    #[cfg(feature = "datafusion")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_json_write_checkpoint() {
+        use std::fs;
+
+        let table_dir = tempfile::tempdir().unwrap();
+        let schema = get_delta_schema();
+        let path = table_dir.path().to_str().unwrap().to_string();
+        let config: HashMap<String, Option<String>> = vec![
+            (
+                "delta.checkpointInterval".to_string(),
+                Some("5".to_string()),
+            ),
+            ("delta.checkpointPolicy".to_string(), Some("v2".to_string())),
+        ]
+        .into_iter()
+        .collect();
+        let mut table = CreateBuilder::new()
+            .with_location(&path)
+            .with_table_name("test-table")
+            .with_comment("A table for running tests")
+            .with_columns(schema.fields().cloned())
+            .with_configuration(config)
+            .await
+            .unwrap();
+        assert_eq!(table.version(), Some(0));
+        let mut writer = JsonWriter::for_table(&table).unwrap();
+        let data = serde_json::json!(
+            {
+                "id" : "A",
+                "value": 42,
+                "modified": "2021-02-01"
+            }
+        );
+        for _ in 1..6 {
+            writer.write(vec![data.clone()]).await.unwrap();
+            writer.flush_and_commit(&mut table).await.unwrap();
+        }
+        let dir_path = path + "/_delta_log";
+
+        let target_file = "00000000000000000004.checkpoint.parquet";
+        let entries: Vec<_> = fs::read_dir(dir_path)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_name().into_string().unwrap() == target_file)
+            .collect();
+        assert_eq!(entries.len(), 1);
+    }
+
+    #[cfg(feature = "datafusion")]
+    #[tokio::test]
+    async fn test_json_write_data_skipping_stats_columns() {
+        let table_dir = tempfile::tempdir().unwrap();
+        let path = table_dir.path().to_str().unwrap().to_string();
+        let config: HashMap<String, Option<String>> = vec![(
+            "delta.dataSkippingStatsColumns".to_string(),
+            Some("id,value".to_string()),
+        )]
+        .into_iter()
+        .collect();
+
+        let schema = get_delta_schema();
+        let mut table = CreateBuilder::new()
+            .with_location(&path)
+            .with_table_name("test-table")
+            .with_comment("A table for running tests")
+            .with_columns(schema.fields().cloned())
+            .with_configuration(config)
+            .await
+            .unwrap();
+        assert_eq!(table.version(), Some(0));
+        let arrow_schema = table.snapshot().unwrap().snapshot().arrow_schema();
+        let mut writer = JsonWriter::try_new(
+            table.table_url().clone(),
+            arrow_schema,
+            Some(vec!["modified".to_string()]),
+            None,
+        )
+        .await
+        .unwrap();
+        let data = serde_json::json!(
+            {
+                "id" : "A",
+                "value": 42,
+                "modified": "2021-02-01"
+            }
+        );
+
+        writer.write(vec![data]).await.unwrap();
+        writer.flush_and_commit(&mut table).await.unwrap();
+        assert_eq!(table.version(), Some(1));
+        let add_actions: Vec<_> = table
+            .snapshot()
+            .unwrap()
+            .snapshot()
+            .file_views(&table.log_store, None)
+            .try_collect()
+            .await
+            .unwrap();
+        assert_eq!(add_actions.len(), 1);
+        let expected_stats = "{\"numRecords\":1,\"minValues\":{\"id\":\"A\",\"value\":42},\"maxValues\":{\"id\":\"A\",\"value\":42},\"nullCount\":{\"id\":0,\"value\":0}}";
+        assert_eq!(
+            expected_stats.parse::<serde_json::Value>().unwrap(),
+            add_actions
+                .into_iter()
+                .next()
+                .unwrap()
+                .stats()
+                .unwrap()
+                .parse::<serde_json::Value>()
+                .unwrap()
+        );
+    }
+
+    #[cfg(feature = "datafusion")]
+    #[tokio::test]
+    async fn test_json_write_data_skipping_num_indexed_cols() {
+        let table_dir = tempfile::tempdir().unwrap();
+        let path = table_dir.path().to_str().unwrap().to_string();
+        let config: HashMap<String, Option<String>> = vec![(
+            "delta.dataSkippingNumIndexedCols".to_string(),
+            Some("1".to_string()),
+        )]
+        .into_iter()
+        .collect();
+
+        let schema = get_delta_schema();
+        let mut table = CreateBuilder::new()
+            .with_location(&path)
+            .with_table_name("test-table")
+            .with_comment("A table for running tests")
+            .with_columns(schema.fields().cloned())
+            .with_configuration(config)
+            .await
+            .unwrap();
+        assert_eq!(table.version(), Some(0));
+        let arrow_schema = table.snapshot().unwrap().snapshot().arrow_schema();
+        let mut writer = JsonWriter::try_new(
+            table.table_url().clone(),
+            arrow_schema,
+            Some(vec!["modified".to_string()]),
+            None,
+        )
+        .await
+        .unwrap();
+        let data = serde_json::json!(
+            {
+                "id" : "A",
+                "value": 42,
+                "modified": "2021-02-01"
+            }
+        );
+
+        writer.write(vec![data]).await.unwrap();
+        writer.flush_and_commit(&mut table).await.unwrap();
+        assert_eq!(table.version(), Some(1));
+        let add_actions: Vec<_> = table
+            .snapshot()
+            .unwrap()
+            .snapshot()
+            .file_views(&table.log_store, None)
+            .try_collect()
+            .await
+            .unwrap();
+        assert_eq!(add_actions.len(), 1);
+        let expected_stats = "{\"numRecords\":1,\"minValues\":{\"id\":\"A\"},\"maxValues\":{\"id\":\"A\"},\"nullCount\":{\"id\":0}}";
+        assert_eq!(
+            expected_stats.parse::<serde_json::Value>().unwrap(),
+            add_actions
+                .into_iter()
+                .next()
+                .unwrap()
+                .stats()
+                .unwrap()
+                .parse::<serde_json::Value>()
+                .unwrap()
+        );
+    }
+}

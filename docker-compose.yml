@@ -1,0 +1,38 @@
+---
+services:
+  localstack:
+    image: localstack/localstack:4
+    ports:
+      - 4566:4566
+      - 8080:8080
+    environment:
+      - SERVICES=s3,dynamodb
+      - DEBUG=1
+      - DATA_DIR=/tmp/localstack/data
+      - PORT_WEB_UI=8080
+      - DOCKER_HOST=unix:///var/run/docker.sock
+      - HOST_TMP_FOLDER=${TMPDIR}
+      - AWS_ACCESS_KEY_ID=deltalake
+      - AWS_SECRET_ACCESS_KEY=weloverust
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:4566/health"]
+
+  fake-gcs:
+    # Custom image - see fsouza/fake-gcs-server#1164
+    image: tustvold/fake-gcs-server
+    command:
+      [
+        "-scheme",
+        "http",
+        "-public-host",
+        "localhost:4443",
+        "-backend",
+        "memory",
+      ]
+    ports:
+      - 4443:4443
+
+  azurite:
+    image: mcr.microsoft.com/azure-storage/azurite:latest
+    ports:
+      - 10000:10000

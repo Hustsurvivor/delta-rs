@@ -1,0 +1,315 @@
+//! Mount file storage backend. This backend read and write objects from mounted filesystem.
+//!
+//! The mount file storage backend is not multi-writer safe.
+
+use bytes::Bytes;
+use futures::stream::BoxStream;
+use object_store::{
+    CopyOptions, Error as ObjectStoreError, GetOptions, GetResult, ListResult, ObjectMeta,
+    ObjectStore, PutOptions, PutResult, RenameOptions, RenameTargetMode,
+    Result as ObjectStoreResult, local::LocalFileSystem, path::Path as ObjectStorePath,
+};
+use object_store::{MultipartUpload, PutMode, PutMultipartOptions, PutPayload};
+use std::ops::Range;
+use std::sync::Arc;
+
+pub(crate) const STORE_NAME: &str = "MountObjectStore";
+
+/// Error raised by storage lock client
+#[derive(thiserror::Error, Debug)]
+#[allow(dead_code)]
+pub enum LocalFileSystemError {
+    /// Object exists already at path
+    #[error("Object exists already at path: {} ({:?})", path, source)]
+    AlreadyExists {
+        /// Path of the already existing file
+        path: String,
+        /// Originating error
+        source: Box<dyn std::error::Error + Send + Sync + 'static>,
+    },
+
+    /// Object not found at the given path
+    #[error("Object not found at path: {} ({:?})", path, source)]
+    NotFound {
+        /// Provided path which does not exist
+        path: String,
+        /// Originating error
+        source: Box<dyn std::error::Error + Send + Sync + 'static>,
+    },
+
+    /// Invalid argument sent to OS call
+    #[error("Invalid argument in OS call for path: {} ({:?})", path, source)]
+    InvalidArgument {
+        /// Provided path
+        path: String,
+        /// Originating error
+        source: errno::Errno,
+    },
+
+    /// Null error for path for FFI
+    #[error("Null error in FFI for path: {} ({:?})", path, source)]
+    NullError {
+        /// Given path
+        path: String,
+        /// Originating error
+        source: std::ffi::NulError,
+    },
+
+    /// Generic catch-all error for this store
+    #[error("Generic error in store: {} ({:?})", store, source)]
+    Generic {
+        /// String name of the object store
+        store: &'static str,
+        /// Originating error
+        source: Box<dyn std::error::Error + Send + Sync + 'static>,
+    },
+
+    /// Errors from the Tokio runtime
+    #[error("Error executing async task for path: {} ({:?})", path, source)]
+    Tokio {
+        /// Path
+        path: String,
+        /// Originating error
+        source: tokio::task::JoinError,
+    },
+}
+
+impl From<LocalFileSystemError> for ObjectStoreError {
+    fn from(e: LocalFileSystemError) -> Self {
+        match e {
+            LocalFileSystemError::AlreadyExists { path, source } => {
+                ObjectStoreError::AlreadyExists { path, source }
+            }
+            LocalFileSystemError::NotFound { path, source } => {
+                ObjectStoreError::NotFound { path, source }
+            }
+            LocalFileSystemError::InvalidArgument { source, .. } => ObjectStoreError::Generic {
+                store: STORE_NAME,
+                source: Box::new(source),
+            },
+            LocalFileSystemError::NullError { source, .. } => ObjectStoreError::Generic {
+                store: STORE_NAME,
+                source: Box::new(source),
+            },
+            LocalFileSystemError::Tokio { source, .. } => ObjectStoreError::Generic {
+                store: STORE_NAME,
+                source: Box::new(source),
+            },
+            LocalFileSystemError::Generic { store, source } => {
+                ObjectStoreError::Generic { store, source }
+            }
+        }
+    }
+}
+
+/// Mount File Storage Backend.
+/// Note that it's non-atomic writing and may leave the filesystem in an inconsistent state if it fails.
+#[derive(Debug)]
+pub struct MountFileStorageBackend {
+    inner: Arc<LocalFileSystem>,
+}
+
+impl MountFileStorageBackend {
+    /// Creates a new MountFileStorageBackend.
+    pub fn try_new() -> ObjectStoreResult<Self> {
+        Ok(Self {
+            inner: Arc::new(LocalFileSystem::new()),
+        })
+    }
+
+    /// Return an absolute filesystem path of the given location
+    fn path_to_filesystem(&self, location: &ObjectStorePath) -> String {
+        let mut url = url::Url::parse("file:///").unwrap();
+        url.set_path(location.as_ref());
+        url.to_file_path().unwrap().to_str().unwrap().to_owned()
+    }
+}
+
+impl std::fmt::Display for MountFileStorageBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "MountFileStorageBackend")
+    }
+}
+
+#[async_trait::async_trait]
+impl ObjectStore for MountFileStorageBackend {
+    async fn put_opts(
+        &self,
+        location: &ObjectStorePath,
+        bytes: PutPayload,
+        mut options: PutOptions,
+    ) -> ObjectStoreResult<PutResult> {
+        // In mounted storage we do an unsafe rename/overwrite
+        // We don't conditionally check whether the file already exists
+        options.mode = PutMode::Overwrite;
+        self.inner.put_opts(location, bytes, options).await
+    }
+
+    async fn get_opts(
+        &self,
+        location: &ObjectStorePath,
+        options: GetOptions,
+    ) -> ObjectStoreResult<GetResult> {
+        self.inner.get_opts(location, options).await
+    }
+
+    async fn get_ranges(
+        &self,
+        location: &ObjectStorePath,
+        ranges: &[Range<u64>],
+    ) -> ObjectStoreResult<Vec<Bytes>> {
+        self.inner.get_ranges(location, ranges).await
+    }
+
+    fn delete_stream(
+        &self,
+        locations: BoxStream<'static, ObjectStoreResult<ObjectStorePath>>,
+    ) -> BoxStream<'static, ObjectStoreResult<ObjectStorePath>> {
+        self.inner.delete_stream(locations)
+    }
+
+    fn list(
+        &self,
+        prefix: Option<&ObjectStorePath>,
+    ) -> BoxStream<'static, ObjectStoreResult<ObjectMeta>> {
+        self.inner.list(prefix)
+    }
+
+    fn list_with_offset(
+        &self,
+        prefix: Option<&ObjectStorePath>,
+        offset: &ObjectStorePath,
+    ) -> BoxStream<'static, ObjectStoreResult<ObjectMeta>> {
+        self.inner.list_with_offset(prefix, offset)
+    }
+
+    async fn list_with_delimiter(
+        &self,
+        prefix: Option<&ObjectStorePath>,
+    ) -> ObjectStoreResult<ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy_opts(
+        &self,
+        from: &ObjectStorePath,
+        to: &ObjectStorePath,
+        options: CopyOptions,
+    ) -> ObjectStoreResult<()> {
+        self.inner.copy_opts(from, to, options).await
+    }
+
+    async fn rename_opts(
+        &self,
+        from: &ObjectStorePath,
+        to: &ObjectStorePath,
+        options: RenameOptions,
+    ) -> ObjectStoreResult<()> {
+        match options.target_mode {
+            RenameTargetMode::Overwrite => self.inner.rename_opts(from, to, options).await,
+            RenameTargetMode::Create => {
+                let path_from = self.path_to_filesystem(from);
+                let path_to = self.path_to_filesystem(to);
+                Ok(regular_rename(path_from.as_ref(), path_to.as_ref()).await?)
+            }
+        }
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &ObjectStorePath,
+        options: PutMultipartOptions,
+    ) -> ObjectStoreResult<Box<dyn MultipartUpload>> {
+        self.inner.put_multipart_opts(location, options).await
+    }
+}
+
+/// Regular renames `from` to `to`.
+/// `from` has to exist, but `to` is not, otherwise the operation will fail.
+/// It's not atomic and cannot be called in parallel with other operations on the same file.
+#[inline]
+async fn regular_rename(from: &str, to: &str) -> Result<(), LocalFileSystemError> {
+    let from_path = String::from(from);
+    let to_path = String::from(to);
+
+    tokio::task::spawn_blocking(move || {
+        if std::fs::metadata(&to_path).is_ok() {
+            Err(LocalFileSystemError::AlreadyExists {
+                path: to_path,
+                source: Box::new(std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    "Already exists",
+                )),
+            })
+        } else if std::path::Path::new(&from_path).exists() {
+            std::fs::rename(&from_path, &to_path).map_err(|err| LocalFileSystemError::Generic {
+                store: STORE_NAME,
+                source: Box::new(err),
+            })
+        } else {
+            Err(LocalFileSystemError::NotFound {
+                path: from_path.clone(),
+                source: Box::new(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("Could not find {from_path}"),
+                )),
+            })
+        }
+    })
+    .await
+    .unwrap()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs::File;
+    use std::io::Write;
+    use std::path::{Path, PathBuf};
+
+    #[tokio::test]
+    async fn test_regular_rename() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let a = create_file(tmp_dir.path(), "a");
+        let b = create_file(tmp_dir.path(), "b");
+        let c = &tmp_dir.path().join("c");
+
+        // unsuccessful move not_exists to C, not_exists is missing
+        let result = regular_rename("not_exists", c.to_str().unwrap()).await;
+        assert!(matches!(
+            result.expect_err("nonexistent should fail"),
+            LocalFileSystemError::NotFound { .. }
+        ));
+
+        // successful move A to C
+        assert!(a.exists());
+        assert!(!c.exists());
+        match regular_rename(a.to_str().unwrap(), c.to_str().unwrap()).await {
+            Err(LocalFileSystemError::InvalidArgument { source, .. }) => panic!(
+                "expected success, got: {source:?}. Note: atomically renaming Windows files from WSL2 is not supported."
+            ),
+            Err(e) => panic!("expected success, got: {e:?}"),
+            _ => {}
+        }
+        assert!(!a.exists());
+        assert!(c.exists());
+
+        // unsuccessful move B to C, C already exists, B is not deleted
+        assert!(b.exists());
+        match regular_rename(b.to_str().unwrap(), c.to_str().unwrap()).await {
+            Err(LocalFileSystemError::AlreadyExists { path, .. }) => {
+                assert_eq!(path, c.to_str().unwrap())
+            }
+            _ => panic!("unexpected"),
+        }
+        assert!(b.exists());
+        assert_eq!(std::fs::read_to_string(c).unwrap(), "a");
+    }
+
+    fn create_file(dir: &Path, name: &str) -> PathBuf {
+        let path = dir.join(name);
+        let mut file = File::create(&path).unwrap();
+        file.write_all(name.as_bytes()).unwrap();
+        path
+    }
+}

@@ -1,0 +1,10 @@
+mkdocs==1.5.3
+# 0.45 results in build errors on our native symbols
+griffe==0.44
+mkdocstrings[python]==0.23.0
+mkdocs-autorefs==0.5.0
+mkdocs-material==9.4.5
+mkdocs-macros-plugin==1.0.4
+markdown-exec[ansi]==1.7.0
+mkdocs-simple-hooks==0.1.5
+mike==2.2.0

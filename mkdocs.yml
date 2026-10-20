@@ -1,0 +1,192 @@
+site_name: Delta Lake Documentation
+site_url: https://delta-io.github.io/delta-rs/
+repo_url: https://github.com/delta-io/delta-rs
+repo_name: delta-io/delta-rs
+
+theme:
+  name: material
+  logo: delta-rust-no-whitespace.svg
+  favicon: delta-rust-no-whitespace.svg
+
+  palette:
+    # Palette toggle for automatic mode
+    - media: "(prefers-color-scheme)"
+      primary: indigo
+      toggle:
+        icon: material/brightness-auto
+        name: Switch to light mode
+
+    # Palette toggle for light mode
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: indigo
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+
+    # Palette toggle for dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: indigo
+      toggle:
+        icon: material/brightness-4
+        name: Switch to system preference
+  locale: en
+  navigation_depth: 3
+  features:
+    - navigation.tracking
+    - navigation.instant
+    - navigation.expand
+    - navigation.tabs
+    - navigation.indexes
+    - navigation.tabs.sticky
+    - navigation.footer
+    - content.tabs.link
+    - content.code.annotation
+    - content.code.copy
+nav:
+  - Home:
+      - Home: index.md
+      - Why Use Delta Lake: why-use-delta-lake.md
+      - Delta Lake for big and small data: delta-lake-big-data-small-data.md
+      - Delta Lake Feature table: feature-table.md
+      - Latest changes: latest.md
+  - Usage:
+      - Installation: usage/installation.md
+      - Overview: usage/overview.md
+      - Creating a table: usage/create-delta-lake-table.md
+      - Loading a table: usage/loading-table.md
+      - Append/overwrite tables: usage/appending-overwriting-delta-lake-table.md
+      - Adding a constraint: usage/constraints.md
+      - Reading Change Data: usage/read-cdf.md
+      - Examining a table: usage/examining-table.md
+      - Querying a table: usage/querying-delta-tables.md
+      - Merging a table: usage/merging-tables.md
+      - Managing a table: usage/managing-tables.md
+      - Working with partitions: usage/working-with-partitions.md
+      - Writing a table:
+          - usage/writing/index.md
+          - usage/writing/writing-to-s3-with-locking-provider.md
+      - Deleting rows from a table: usage/deleting-rows-from-delta-lake-table.md
+      - Best practices: usage/delta-lake-best-practices.md
+      - Optimize:
+          - Small file compaction: usage/optimize/small-file-compaction-with-optimize.md
+          - Z Order: usage/optimize/delta-lake-z-order.md
+  - API Reference:
+      - api/delta_writer.md
+      - Table:
+          - api/delta_table/index.md
+          - api/delta_table/metadata.md
+          - api/delta_table/delta_table_merger.md
+          - api/delta_table/delta_table_optimizer.md
+          - api/delta_table/delta_table_alterer.md
+      - api/schema.md
+      - api/storage.md
+      - api/query.md
+      - api/transaction.md
+      - api/exceptions.md
+  - Integrations:
+      - Object Storage:
+          - integrations/object-storage/adls.md
+          - integrations/object-storage/gcs.md
+          - integrations/object-storage/hdfs.md
+          - integrations/object-storage/s3.md
+          - integrations/object-storage/s3-like.md
+          - integrations/object-storage/lakefs.md
+          - integrations/object-storage/opendal.md
+          - integrations/object-storage/special_configuration.md
+      - Arrow: integrations/delta-lake-arrow.md
+      - Daft: integrations/delta-lake-daft.md
+      - Dagster: integrations/delta-lake-dagster.md
+      - Dask: integrations/delta-lake-dask.md
+      - DataFusion: integrations/delta-lake-datafusion.md
+      - pandas: integrations/delta-lake-pandas.md
+      - Polars: integrations/delta-lake-polars.md
+  - How Delta Lake works:
+      - Architecture: how-delta-lake-works/architecture-of-delta-table.md
+      - Transactions: how-delta-lake-works/delta-lake-acid-transactions.md
+      - File skipping: how-delta-lake-works/delta-lake-file-skipping.md
+  - Upgrade guides:
+      - Version 1.0.0: upgrade-guides/guide-1.0.0.md
+      - Rust 1.1.0: upgrade-guides/guide-rust-1.1.0.md
+  - About:
+      - Contributing: about/contributing.md
+      - History: about/history.md
+not_in_nav: |
+  /_build/
+
+exclude_docs: |
+  /_build/
+  /Makefile
+  /mlc_config.json
+  /src
+  /requirements.txt
+  *.py
+
+plugins:
+  - mike:
+      # Every version declares /latest/ as canonical, so search engines index
+      # one copy of each page instead of one per release.
+      canonical_version: latest
+  - autorefs
+  - mkdocstrings:
+      handlers:
+        python:
+          path: [../python]
+          options:
+            show_root_toc_entry: false
+            docstring_section_style: table
+            filters: ["!^_", "^__init__$"]
+            heading_level: 3
+            show_source: false
+            show_symbol_type_in_heading: true
+            show_signature_annotations: true
+            show_root_heading: true
+            show_root_full_path: true
+            separate_signature: true
+            docstring_options:
+              ignore_init_summary: false
+            merge_init_into_class: true
+          import:
+            # for cross references
+            - https://arrow.apache.org/docs/objects.inv
+            - https://pandas.pydata.org/docs/objects.inv
+  - search:
+      lang: en
+  - markdown-exec
+  - macros:
+      module_name: docs/_build/macro
+  - mkdocs-simple-hooks:
+      hooks:
+        on_page_markdown: "docs._build.hooks:on_page_markdown"
+
+markdown_extensions:
+  - pymdownx.highlight:
+      anchor_linenums: true
+      line_spans: __span
+      pygments_lang_class: true
+  - pymdownx.inlinehilite
+  - admonition
+  - pymdownx.details
+  - attr_list
+  - pymdownx.emoji:
+      emoji_index: !!python/name:material.extensions.emoji.twemoji
+      emoji_generator: !!python/name:material.extensions.emoji.to_svg
+  - pymdownx.superfences
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.snippets:
+      base_path: [".", "docs/src/"]
+      check_paths: true
+      dedent_subsections: true
+  - footnotes
+
+extra:
+  version:
+    provider: mike
+  python_api_url: https://delta-io.github.io/delta-rs/api/
+  generator: false
+  social:
+    - icon: fontawesome/brands/slack
+      link: https://go.delta.io/slack
+      name: Delta slack channel

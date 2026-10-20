@@ -1,0 +1,279 @@
+"""Test that pyspark can read tables written by deltalake(delta-rs)."""
+
+import pathlib
+from typing import TYPE_CHECKING
+
+import pytest
+
+from deltalake import DeltaTable, write_deltalake
+
+from .utils import assert_spark_read_equal, get_spark
+
+if TYPE_CHECKING:
+    import pyarrow as pa
+
+try:
+    import delta
+    import delta.pip_utils
+    import delta.tables
+    import pyspark.pandas as ps
+
+    spark = get_spark()
+except ModuleNotFoundError:
+    pass
+
+
+@pytest.mark.pyspark
+@pytest.mark.integration
+def test_basic_read(
+    request, sample_data_pyarrow: "pa.Table", existing_table: DeltaTable
+):
+    if "timestamp_ns" in sample_data_pyarrow.column_names:
+        pytest.skip("Nanosecond timestamps are not supported in PySpark at the moment")
+
+    uri = existing_table._table.table_uri() + "/"
+
+    assert_spark_read_equal(sample_data_pyarrow, uri)
+
+    dt = delta.tables.DeltaTable.forPath(spark, uri)
+    history = dt.history().collect()
+    assert len(history) == 1
+    assert history[0].version == 0
+
+
+@pytest.mark.pyspark
+@pytest.mark.pyarrow
+@pytest.mark.integration
+def test_partitioned(tmp_path: pathlib.Path, sample_data_pyarrow: "pa.Table"):
+    if "timestamp_ns" in sample_data_pyarrow.column_names:
+        pytest.skip("Nanosecond timestamps are not supported in PySpark at the moment")
+    partition_cols = ["date32", "utf8", "timestamp", "bool"]
+    import pyarrow as pa
+
+    # Add null values to sample data to verify we can read null partitions
+    sample_data_with_null = sample_data_pyarrow
+    for col in partition_cols:
+        i = sample_data_pyarrow.schema.get_field_index(col)
+        field = sample_data_pyarrow.schema.field(i)
+        nulls = pa.array([None] * sample_data_pyarrow.num_rows, type=field.type)
+        sample_data_with_null = sample_data_with_null.set_column(i, field, nulls)
+    data = pa.concat_tables([sample_data_pyarrow, sample_data_with_null])
+
+    write_deltalake(str(tmp_path), data, partition_by=partition_cols)
+
+    assert_spark_read_equal(data, str(tmp_path), sort_by=["utf8", "int32"])
+
+
+@pytest.mark.pyspark
+@pytest.mark.pyarrow
+@pytest.mark.integration
+def test_overwrite(
+    tmp_path: pathlib.Path, sample_data_pyarrow: "pa.Table", existing_table: DeltaTable
+):
+    if "timestamp_ns" in sample_data_pyarrow.column_names:
+        pytest.skip("Nanosecond timestamps are not supported in PySpark at the moment")
+    import pyarrow as pa
+
+    path = str(tmp_path)
+
+    write_deltalake(path, sample_data_pyarrow, mode="append")
+    expected = pa.concat_tables([sample_data_pyarrow, sample_data_pyarrow])
+    assert_spark_read_equal(expected, path)
+
+    write_deltalake(path, sample_data_pyarrow, mode="overwrite")
+    assert_spark_read_equal(sample_data_pyarrow, path)
+
+
+@pytest.mark.pyspark
+@pytest.mark.pyarrow
+@pytest.mark.integration
+def test_issue_1591_roundtrip_special_characters(tmp_path: pathlib.Path):
+    import pyarrow as pa
+
+    test_string = r'$%&/()=^"[]#*?.:_-{=}|`<>~/\r\n+'
+    poisoned = "}|`<>~"
+    for char in poisoned:
+        test_string = test_string.replace(char, "")
+
+    data = pa.table(
+        {
+            "string": pa.array([test_string], type=pa.utf8()),
+            "data": pa.array(["python-module-test-write"]),
+        }
+    )
+
+    deltalake_path = tmp_path / "deltalake"
+    write_deltalake(
+        table_or_uri=deltalake_path, mode="append", data=data, partition_by=["string"]
+    )
+
+    loaded = ps.read_delta(str(deltalake_path), index_col=None).to_pandas()
+    assert loaded.shape == data.shape
+
+    spark_path = tmp_path / "spark"
+    spark_df = spark.createDataFrame(data.to_pandas())
+    spark_df.write.format("delta").partitionBy(["string"]).save(str(spark_path))
+
+    loaded = DeltaTable(spark_path).to_pandas()
+    assert loaded.shape == data.shape
+
+
+@pytest.mark.pyspark
+@pytest.mark.pyarrow
+@pytest.mark.integration
+def test_read_checkpointed_table(tmp_path: pathlib.Path):
+    import pyarrow as pa
+
+    data = pa.table(
+        {
+            "int": pa.array([1]),
+        }
+    )
+    write_deltalake(tmp_path, data)
+
+    dt = DeltaTable(tmp_path)
+    dt.create_checkpoint()
+
+    assert_spark_read_equal(data, str(tmp_path), ["int"])
+
+
+@pytest.mark.pyspark
+@pytest.mark.pyarrow
+@pytest.mark.integration
+def test_read_checkpointed_features_table(tmp_path: pathlib.Path):
+    from datetime import datetime
+
+    import pyarrow as pa
+
+    data = pa.table(
+        {
+            "timestamp": pa.array([datetime(2010, 1, 1)]),
+        }
+    )
+    write_deltalake(tmp_path, data)
+
+    dt = DeltaTable(tmp_path)
+    dt.create_checkpoint()
+
+    assert_spark_read_equal(data, str(tmp_path), ["timestamp"])
+
+
+@pytest.mark.pyspark
+@pytest.mark.pyarrow
+@pytest.mark.integration
+def test_invariants_and_the_implication(tmp_path: pathlib.Path):
+    """
+    Regression test associated with <https://github.com/delta-io/delta-rs/issues/2882>
+    """
+    from pandas import DataFrame
+    from pyspark.sql import SparkSession
+
+    from deltalake import write_deltalake
+
+    write_deltalake(
+        tmp_path,
+        data=DataFrame({"id": [1, 2], "values": [2, 1], "date": [None, None]}),
+        configuration={
+            "delta.minReaderVersion": "1",
+            "delta.minWriterVersion": "2",
+        },  # silently ignored
+    )
+
+    spark = (
+        SparkSession.builder.appName("failing-delta-load")
+        .config("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension")
+        .config(
+            "spark.sql.catalog.spark_catalog",
+            "org.apache.spark.sql.delta.catalog.DeltaCatalog",
+        )
+        .config("spark.jars", "delta-spark_2.12-3.2.0.jar,delta-storage-3.2.0.jar")
+        .getOrCreate()
+    )
+
+    df = spark.read.format("delta").load(str(tmp_path))
+
+    for row in df.collect():
+        print(row)
+
+
+@pytest.mark.pyspark
+@pytest.mark.pyarrow
+@pytest.mark.integration
+def test_column_mapping_with_pyspark(tmp_path: pathlib.Path):
+    """
+    Regression test associated with:
+    <https://github.com/delta-io/delta-rs/issues/4501>
+    """
+
+    from pyspark.sql import types as T
+
+    from deltalake import DeltaTable
+
+    schema = T.StructType(
+        [
+            T.StructField("id", T.IntegerType(), nullable=False),
+            T.StructField("name", T.StringType(), nullable=True),
+            T.StructField(
+                "address",  # ← name of the struct column
+                T.StructType(
+                    [
+                        T.StructField(
+                            "address", T.StringType(), True
+                        ),  # ← same name, as struct⚠️
+                        T.StructField("city", T.StringType(), True),
+                        T.StructField("zip", T.StringType(), True),
+                    ]
+                ),
+                nullable=True,
+            ),
+        ]
+    )
+
+    data = [
+        (1, "Alice", ("10 Downing St", "London", "SW1A 2AA")),
+        (2, "Bob", ("1600 Pennsylvania Ave", "Washington", "20500")),
+    ]
+
+    df = spark.createDataFrame(data, schema)
+
+    # write initial Delta table
+    df.write.format("delta").mode("overwrite").save(tmp_path.as_posix())
+
+    df_read_again = spark.read.load(path=tmp_path.as_posix(), format="delta")
+    df_read_again.show(truncate=False)
+    df_read_again.printSchema()
+
+    log = (
+        (tmp_path / "_delta_log" / "00000000000000000000.json").read_text().splitlines()
+    )
+    print(
+        "_delta_log:",
+        *log,
+        sep="\n",
+        end="\n\n",
+    )
+
+    # upgrade table protocol
+    spark.sql(
+        f"""
+        ALTER TABLE delta.`{tmp_path.as_posix()}`
+        SET TBLPROPERTIES (
+            'delta.minReaderVersion'     = '2',
+            'delta.minWriterVersion'     = '5',
+            'delta.columnMapping.mode'   = 'name'
+        )
+        """
+    )
+    log = (
+        (tmp_path / "_delta_log" / "00000000000000000001.json").read_text().splitlines()
+    )
+    print(
+        "_delta_log:",
+        *log,
+        sep="\n",
+        end="\n\n",
+    )
+
+    # trying to access table using delta-rs will fail ❌
+    dt = DeltaTable(tmp_path.as_posix())
+    print(dt.schema())

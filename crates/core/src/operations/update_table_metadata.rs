@@ -1,0 +1,134 @@
+//! Update table metadata operation
+
+use futures::future::BoxFuture;
+use validator::Validate;
+
+use crate::DeltaTable;
+use crate::kernel::transaction::CommitProperties;
+use crate::kernel::{Action, EagerSnapshot, MetadataExt, SnapshotMetadataRef, resolve_snapshot};
+use crate::logstore::LogStoreRef;
+use crate::operations::commit_actions_in_scope;
+use crate::protocol::DeltaOperation;
+use crate::{DeltaResult, DeltaTableError};
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Validate)]
+#[validate(schema(
+    function = "validate_at_least_one_field",
+    message = "No metadata update specified"
+))]
+/// A validated set of metadata fields to update on a Delta table.
+///
+/// At least one field must be provided; lengths are validated to stay within Delta's limits.
+pub struct TableMetadataUpdate {
+    /// New table name. When set, must be 1-255 characters.
+    #[validate(length(
+        min = 1,
+        max = 255,
+        message = "Table name cannot be empty and cannot exceed 255 characters"
+    ))]
+    pub name: Option<String>,
+    /// New table description. When set, must be at most 4000 characters.
+    #[validate(length(
+        max = 4000,
+        message = "Table description cannot exceed 4000 characters"
+    ))]
+    pub description: Option<String>,
+}
+
+fn validate_at_least_one_field(
+    update: &TableMetadataUpdate,
+) -> Result<(), validator::ValidationError> {
+    if update.name.is_none() && update.description.is_none() {
+        return Err(validator::ValidationError::new("no_fields_specified"));
+    }
+    Ok(())
+}
+
+/// Update table metadata operation
+pub struct UpdateTableMetadataBuilder {
+    /// A snapshot of the table's state
+    snapshot: Option<EagerSnapshot>,
+    /// The metadata update to apply
+    update: Option<TableMetadataUpdate>,
+    /// Delta object store for handling data files
+    log_store: LogStoreRef,
+    /// Additional information to add to the commit
+    commit_properties: CommitProperties,
+}
+
+impl UpdateTableMetadataBuilder {
+    /// Create a new builder
+    pub(crate) fn new(log_store: LogStoreRef, snapshot: Option<EagerSnapshot>) -> Self {
+        Self {
+            update: None,
+            snapshot,
+            log_store,
+            commit_properties: CommitProperties::default(),
+        }
+    }
+
+    /// Specify the complete metadata update
+    pub fn with_update(mut self, update: TableMetadataUpdate) -> Self {
+        self.update = Some(update);
+        self
+    }
+
+    /// Additional metadata to be added to commit info
+    pub fn with_commit_properties(mut self, commit_properties: CommitProperties) -> Self {
+        self.commit_properties = commit_properties;
+        self
+    }
+}
+
+fn plan_update_table_metadata_actions(
+    snapshot: SnapshotMetadataRef<'_>,
+    update: TableMetadataUpdate,
+) -> DeltaResult<(Vec<Action>, DeltaOperation)> {
+    let mut metadata = snapshot.metadata.clone();
+
+    if let Some(name) = &update.name {
+        metadata = metadata.with_name(name.clone())?;
+    }
+    if let Some(description) = &update.description {
+        metadata = metadata.with_description(description.clone())?;
+    }
+
+    let operation = DeltaOperation::UpdateTableMetadata {
+        metadata_update: update,
+    };
+
+    Ok((vec![Action::Metadata(metadata)], operation))
+}
+
+impl std::future::IntoFuture for UpdateTableMetadataBuilder {
+    type Output = DeltaResult<DeltaTable>;
+
+    type IntoFuture = BoxFuture<'static, Self::Output>;
+
+    fn into_future(self) -> Self::IntoFuture {
+        let this = self;
+
+        Box::pin(async move {
+            let snapshot = resolve_snapshot(&this.log_store, this.snapshot.clone(), None).await?;
+
+            let update = this.update.ok_or_else(|| {
+                DeltaTableError::MetadataError("No metadata update specified".to_string())
+            })?;
+            update
+                .validate()
+                .map_err(|e| DeltaTableError::MetadataError(format!("{e}")))?;
+
+            let (actions, operation) =
+                plan_update_table_metadata_actions(snapshot.snapshot().metadata_state(), update)?;
+
+            commit_actions_in_scope(
+                &this.log_store,
+                &snapshot,
+                this.commit_properties,
+                actions,
+                operation,
+            )
+            .await
+        })
+    }
+}

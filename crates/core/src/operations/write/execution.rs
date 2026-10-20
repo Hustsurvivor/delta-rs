@@ -1,0 +1,1127 @@
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+use std::sync::{Arc, OnceLock};
+
+use arrow::datatypes::Schema;
+use arrow_array::RecordBatch;
+use datafusion::catalog::Session;
+use datafusion::common::ToDFSchema;
+use datafusion::logical_expr::{Expr, col, lit, when};
+use datafusion::physical_expr::expressions::col as physical_col;
+use datafusion::physical_plan::projection::ProjectionExec;
+use datafusion::physical_plan::repartition::RepartitionExec;
+use datafusion::physical_plan::{
+    ExecutionPlan, ExecutionPlanProperties, Partitioning, SendableRecordBatchStream,
+    execute_stream_partitioned,
+};
+use delta_kernel::table_configuration::TableConfiguration;
+use futures::StreamExt as _;
+use object_store::path::Path;
+use tokio::sync::mpsc;
+use tokio::task::JoinSet;
+
+use crate::DeltaTableError;
+use crate::datafile::DeltaWriterProperties;
+use crate::datafile::writer::{DeltaWriter, UploadBudget, WriterConfig, write_batches_timed};
+use crate::delta_datafusion::{ColumnMappingState, DataValidationExec, validation_predicates};
+use crate::errors::DeltaResult;
+use crate::kernel::{Action, Add, AddCDCFile};
+use crate::logstore::{LogStore, ObjectStoreRef};
+use crate::operations::cdc::CDC_COLUMN_NAME;
+
+/// Error message used when a worker's `send` fails because the writer task has
+/// already closed the channel (e.g. the writer errored). It is recognised by
+/// [`is_writer_task_closed_error`] so the real (writer) error is surfaced
+/// instead of this downstream symptom.
+const WRITER_TASK_CLOSED_UNEXPECTEDLY_MSG: &str = "Writer task closed unexpectedly";
+
+#[cfg(test)]
+mod tests {
+    use std::num::NonZeroU64;
+    use std::pin::Pin;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+    use std::task::{Context, Poll};
+    use std::time::Duration;
+
+    use arrow_array::{Int64Array, RecordBatch};
+    use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+    use datafusion::common::Result as DataFusionResult;
+    use datafusion::error::DataFusionError;
+    use datafusion::physical_plan::{RecordBatchStream, stream::RecordBatchStreamAdapter};
+    use futures::{Stream, stream};
+    use object_store::memory::InMemory;
+    use rstest::rstest;
+
+    use crate::datafile::writer::test_utils::test_props;
+
+    use super::{
+        ObjectStoreRef, SendableRecordBatchStream, WriterConfig, parse_positive_usize,
+        write_streams,
+    };
+
+    #[rstest]
+    #[case::zero(Some("0"), 7)]
+    #[case::negative(Some("-1"), 7)]
+    #[case::unparsable(Some("1GB"), 7)]
+    #[case::empty(Some(""), 7)]
+    #[case::missing(None, 7)]
+    #[case::positive(Some("8"), 8)]
+    fn parse_positive_usize_falls_back_only_on_a_non_positive_value(
+        #[case] raw: Option<&str>,
+        #[case] expected: usize,
+    ) {
+        assert_eq!(parse_positive_usize(raw, 7), expected);
+    }
+
+    fn write_streams_schema() -> Arc<ArrowSchema> {
+        Arc::new(ArrowSchema::new(vec![Field::new(
+            "id",
+            DataType::Int32,
+            true,
+        )]))
+    }
+
+    fn write_streams_config(schema: Arc<ArrowSchema>) -> WriterConfig {
+        WriterConfig::new(
+            schema,
+            vec![],
+            test_props(None, None, Some(NonZeroU64::new(1024).unwrap()), Some(1024)),
+        )
+    }
+
+    fn write_streams_object_store() -> ObjectStoreRef {
+        Arc::new(InMemory::new()) as ObjectStoreRef
+    }
+
+    struct PendingDropStream {
+        schema: Arc<ArrowSchema>,
+        dropped: Arc<AtomicBool>,
+    }
+
+    impl Drop for PendingDropStream {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::SeqCst);
+        }
+    }
+
+    impl Stream for PendingDropStream {
+        type Item = DataFusionResult<RecordBatch>;
+
+        fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+            Poll::Pending
+        }
+    }
+
+    impl RecordBatchStream for PendingDropStream {
+        fn schema(&self) -> Arc<ArrowSchema> {
+            self.schema.clone()
+        }
+    }
+
+    #[tokio::test]
+    async fn test_write_streams_empty_is_noop() {
+        // No input streams: must return an empty result (no producers spawned).
+        let config = write_streams_config(write_streams_schema());
+        let (adds, metrics) = write_streams(vec![], write_streams_object_store(), config)
+            .await
+            .unwrap();
+        assert!(adds.is_empty());
+        assert_eq!(metrics.rows_written, 0);
+    }
+
+    #[tokio::test]
+    async fn test_write_streams_aborts_workers_when_writer_fails() {
+        let expected_schema = write_streams_schema();
+        let config = write_streams_config(expected_schema.clone());
+
+        let dropped = Arc::new(AtomicBool::new(false));
+        let pending_stream: SendableRecordBatchStream = Box::pin(PendingDropStream {
+            schema: expected_schema,
+            dropped: dropped.clone(),
+        });
+
+        let bad_schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "id",
+            DataType::Int64,
+            true,
+        )]));
+        let bad_batch = RecordBatch::try_new(
+            bad_schema.clone(),
+            vec![Arc::new(Int64Array::from(vec![1_i64]))],
+        )
+        .unwrap();
+        let failing_stream: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+            bad_schema,
+            stream::iter(vec![Ok::<RecordBatch, datafusion::error::DataFusionError>(
+                bad_batch,
+            )]),
+        ));
+
+        let object_store = write_streams_object_store();
+        let result =
+            write_streams(vec![pending_stream, failing_stream], object_store, config).await;
+
+        let err = result
+            .expect_err("expected writer failure when stream schema mismatches writer config");
+        let err_msg = err.to_string();
+        assert!(
+            err_msg.contains("Unexpected Arrow schema"),
+            "expected writer schema mismatch error, got: {err_msg}"
+        );
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "expected pending worker stream to be dropped when writer fails"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_write_streams_does_not_hang_when_worker_fails() {
+        let expected_schema = write_streams_schema();
+        let config = write_streams_config(expected_schema.clone());
+
+        let dropped = Arc::new(AtomicBool::new(false));
+        let pending_stream: SendableRecordBatchStream = Box::pin(PendingDropStream {
+            schema: expected_schema.clone(),
+            dropped: dropped.clone(),
+        });
+
+        let failing_worker_stream: SendableRecordBatchStream =
+            Box::pin(RecordBatchStreamAdapter::new(
+                expected_schema,
+                stream::iter(vec![Err::<RecordBatch, DataFusionError>(
+                    DataFusionError::Execution("worker stream failed".to_string()),
+                )]),
+            ));
+
+        let object_store = write_streams_object_store();
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            write_streams(
+                vec![pending_stream, failing_worker_stream],
+                object_store,
+                config,
+            ),
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "write_streams hung waiting for writer completion"
+        );
+        let result = result.unwrap();
+        assert!(result.is_err(), "expected worker stream failure to surface");
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "expected pending stream to be dropped when a worker fails"
+        );
+    }
+}
+
+const DEFAULT_WRITER_BATCH_CHANNEL_SIZE: usize = 10;
+
+/// Try parse a positive `usize` knob, falling back to `default`
+fn parse_positive_usize(raw: Option<&str>, default: usize) -> usize {
+    raw.and_then(|s| s.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default)
+}
+
+/// How many record batches may be in flight on a write path. It bounds the
+/// producer→writer channel capacity in `write_streams` (and the change-data
+/// fan-in). Tunable via `DELTARS_WRITER_BATCH_CHANNEL_SIZE` (default 10); read once.
+fn writer_batch_concurrency() -> usize {
+    static CONCURRENCY: OnceLock<usize> = OnceLock::new();
+    *CONCURRENCY.get_or_init(|| {
+        parse_positive_usize(
+            std::env::var("DELTARS_WRITER_BATCH_CHANNEL_SIZE")
+                .ok()
+                .as_deref(),
+            DEFAULT_WRITER_BATCH_CHANNEL_SIZE,
+        )
+    })
+}
+
+/// Cap on concurrent writer tasks. Each writer holds open multipart uploads
+/// and in-memory buffers, so more writers means higher memory and FD usage.
+/// Defaults to `available_parallelism` (matching DataFusion's `target_partitions`),
+/// clamped to [1, 128]. Override via `DELTARS_MAX_CONCURRENT_WRITERS`.
+/// Distinct from `DELTARS_WRITER_BATCH_CHANNEL_SIZE` (channel backpressure) and
+/// `DELTARS_MAX_CONCURRENCY_TASKS` in `datafile::writer` (per-file multipart upload
+/// parallelism).
+fn max_concurrent_writers() -> usize {
+    static MAX_WRITERS: OnceLock<usize> = OnceLock::new();
+    *MAX_WRITERS.get_or_init(|| {
+        std::env::var("DELTARS_MAX_CONCURRENT_WRITERS")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or_else(|| {
+                std::thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(1)
+            })
+            .clamp(1, 128)
+    })
+}
+
+/// Metrics captured from execution
+#[derive(Debug, Default)]
+pub(crate) struct WriteExecutionPlanMetrics {
+    pub scan_time_ms: u64,
+    pub write_time_ms: u64,
+}
+
+/// Directory under the table root for change data files.
+const CHANGE_DATA_DIR: &str = "_change_data";
+
+struct WriteSinkConfig {
+    partition_columns: Vec<String>,
+    object_store: ObjectStoreRef,
+    /// How the files are encoded, with the table's stats config filled in.
+    props: DeltaWriterProperties,
+    column_mapping: Option<ColumnMappingState>,
+    /// Directory under the table root the data files go below.
+    path_prefix: Option<Path>,
+}
+
+impl WriteSinkConfig {
+    fn new(
+        table_config: &TableConfiguration,
+        object_store: ObjectStoreRef,
+        props: DeltaWriterProperties,
+    ) -> Self {
+        Self {
+            partition_columns: table_config.metadata().partition_columns().to_vec(),
+            object_store,
+            props: props.apply_table_stats(table_config),
+            column_mapping: ColumnMappingState::from_table_config(table_config),
+            path_prefix: None,
+        }
+    }
+
+    fn with_path_prefix(mut self, prefix: &str) -> Self {
+        self.path_prefix = Some(Path::from(prefix));
+        self
+    }
+}
+
+/// `plan` under the table's constraint and invariant checks plus the rewrite
+/// `predicate`, with the internal insert-marker column dropped.
+fn validated_plan(
+    table_config: &TableConfiguration,
+    session: &dyn Session,
+    plan: Arc<dyn ExecutionPlan>,
+    predicate: Option<Expr>,
+    contains_cdc: bool,
+    insert_marker_column: Option<&str>,
+) -> DeltaResult<Arc<dyn ExecutionPlan>> {
+    let mut validations =
+        validation_predicates(session, &plan.schema().to_dfschema()?, table_config)?;
+
+    if let Some(mut pred) = predicate {
+        // DataRescue uses an internal insert-marker column; CDC-only plans rely on `_change_type`.
+        // A rewrite plan never needs both paths at once.
+        if let Some(insert_marker_column) = insert_marker_column {
+            pred = when(col(insert_marker_column).eq(lit(true)), pred).otherwise(lit(true))?;
+        } else if contains_cdc {
+            pred = when(col(CDC_COLUMN_NAME).eq(lit("insert")), pred).otherwise(lit(true))?;
+        }
+        validations.push(pred);
+    }
+
+    let plan = DataValidationExec::try_new_with_predicates(session, plan, validations)?;
+    match insert_marker_column {
+        Some(insert_marker_column) => drop_internal_column(plan, insert_marker_column),
+        None => Ok(plan),
+    }
+}
+
+/// The change data action for `add`, whose path is already table-relative.
+fn add_cdc_file(add: Add) -> Action {
+    Action::Cdc(AddCDCFile {
+        path: add.path,
+        size: add.size,
+        partition_values: add.partition_values,
+        data_change: false,
+        tags: add.tags,
+    })
+}
+
+/// A plan with its (physical) partition columns and optional random-prefix length.
+type ColumnMappedPlan = (Arc<dyn ExecutionPlan>, Vec<String>, Option<usize>);
+
+/// Apply column mapping to a write plan: wrap it so its batches are emitted physically, translate
+/// partition columns to physical names, and request a random file prefix. No-op (returns its
+/// inputs) when `column_mapping` is `None`.
+fn apply_column_mapping_to_plan(
+    plan: Arc<dyn ExecutionPlan>,
+    partition_columns: Vec<String>,
+    column_mapping: &Option<ColumnMappingState>,
+) -> DeltaResult<ColumnMappedPlan> {
+    match column_mapping {
+        None => Ok((plan, partition_columns, None)),
+        Some(state) => {
+            let plan = state.wrap_plan(plan)?;
+            let physical_partition_columns =
+                state.physical_partition_columns(&partition_columns)?;
+            Ok((
+                plan,
+                physical_partition_columns,
+                Some(state.random_prefix_length()),
+            ))
+        }
+    }
+}
+
+/// Metrics captured from draining streams through a writer.
+#[derive(Debug, Default)]
+pub(crate) struct WriteStreamMetrics {
+    pub rows_written: u64,
+    pub write_time_ms: u64,
+}
+
+pub(crate) async fn write_execution_plan_cdc(
+    table_config: &TableConfiguration,
+    session: &dyn Session,
+    plan: Arc<dyn ExecutionPlan>,
+    object_store: ObjectStoreRef,
+    props: DeltaWriterProperties,
+) -> DeltaResult<Vec<Action>> {
+    let plan = validated_plan(table_config, session, plan, None, false, None)?;
+    let sink_config =
+        WriteSinkConfig::new(table_config, object_store, props).with_path_prefix(CHANGE_DATA_DIR);
+    let (actions, _) = write_data_plan(session, plan, sink_config).await?;
+    Ok(actions
+        .into_iter()
+        .map(|action| match action {
+            Action::Add(add) => add_cdc_file(add),
+            _ => panic!("Expected Add action"),
+        })
+        .collect())
+}
+
+pub(crate) async fn write_execution_plan(
+    table_config: &TableConfiguration,
+    session: &dyn Session,
+    plan: Arc<dyn ExecutionPlan>,
+    object_store: ObjectStoreRef,
+    props: DeltaWriterProperties,
+) -> DeltaResult<Vec<Action>> {
+    let (actions, _) = write_execution_plan_v2(
+        table_config,
+        session,
+        plan,
+        object_store,
+        props,
+        None,
+        false,
+        None,
+    )
+    .await?;
+    Ok(actions)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn write_execution_plan_v2(
+    table_config: &TableConfiguration,
+    session: &dyn Session,
+    plan: Arc<dyn ExecutionPlan>,
+    object_store: ObjectStoreRef,
+    props: DeltaWriterProperties,
+    predicate: Option<Expr>,
+    contains_cdc: bool,
+    insert_marker_column: Option<String>,
+) -> DeltaResult<(Vec<Action>, WriteExecutionPlanMetrics)> {
+    let plan = validated_plan(
+        table_config,
+        session,
+        plan,
+        predicate,
+        contains_cdc,
+        insert_marker_column.as_deref(),
+    )?;
+    let sink_config = WriteSinkConfig::new(table_config, object_store, props);
+
+    if !contains_cdc {
+        write_data_plan(session, plan, sink_config).await
+    } else {
+        write_cdc_plan(session, plan, sink_config).await
+    }
+}
+
+fn drop_internal_column(
+    plan: Arc<dyn ExecutionPlan>,
+    column: &str,
+) -> DeltaResult<Arc<dyn ExecutionPlan>> {
+    let schema = plan.schema();
+    let expressions: Vec<_> = schema
+        .fields()
+        .iter()
+        .filter(|field| field.name() != column)
+        .map(|field| {
+            physical_col(field.name(), &schema)
+                .map(|expr| (expr, field.name().clone()))
+                .map_err(DeltaTableError::from)
+        })
+        .collect::<DeltaResult<_>>()?;
+
+    if expressions.len() == schema.fields().len() {
+        return Ok(plan);
+    }
+
+    Ok(Arc::new(ProjectionExec::try_new(expressions, plan)?))
+}
+
+pub(crate) async fn write_exec_plan(
+    session: &dyn Session,
+    log_store: &dyn LogStore,
+    table_config: &TableConfiguration,
+    exec: Arc<dyn ExecutionPlan>,
+    write_as_cdc: bool,
+    props: DeltaWriterProperties,
+) -> DeltaResult<(Vec<Action>, WriteExecutionPlanMetrics)> {
+    let sink_config = WriteSinkConfig::new(table_config, log_store.object_store(), props);
+
+    if write_as_cdc {
+        write_cdc_plan(session, exec, sink_config).await
+    } else {
+        write_data_plan(session, exec, sink_config).await
+    }
+}
+
+fn is_writer_task_closed_error(err: &DeltaTableError) -> bool {
+    matches!(err, DeltaTableError::Generic(msg) if msg == WRITER_TASK_CLOSED_UNEXPECTEDLY_MSG)
+}
+
+/// Synthetic error the writer task returns when it aborted because the write was
+/// cancelled (a worker failed, or the whole `write_streams` future was dropped).
+/// Recognized so the original failure is surfaced instead of this symptom.
+const WRITE_CANCELLED_MSG: &str = "write cancelled before completion";
+
+fn is_write_cancelled_error(err: &DeltaTableError) -> bool {
+    matches!(err, DeltaTableError::Generic(msg) if msg == WRITE_CANCELLED_MSG)
+}
+
+/// Sets the shared cancellation flag when dropped while armed. Held by the
+/// `write_streams` future so that dropping it (e.g. a sibling partition's
+/// failure aborting this task) poisons the detached writer task, which then
+/// aborts its uploads at channel EOF instead of finalizing orphan files.
+struct CancelOnDrop {
+    flag: Arc<AtomicBool>,
+    armed: bool,
+}
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        if self.armed {
+            self.flag.store(true, AtomicOrdering::Release);
+        }
+    }
+}
+
+/// Drain one or more streams through a single [`DeltaWriter`].
+///
+/// One worker task is spawned per input stream (so the per-stream scan/compute in
+/// `next()` parallelizes across runtime threads); all workers feed the writer task
+/// over a bounded channel (capacity `writer_batch_concurrency()`), overlapping
+/// scan/compute with parquet encode+upload under backpressure. On any stream or
+/// writer error the remaining workers are aborted, the writer aborts its uploads,
+/// and the underlying error is surfaced.
+pub(crate) async fn write_streams(
+    streams: Vec<SendableRecordBatchStream>,
+    object_store: ObjectStoreRef,
+    config: WriterConfig,
+) -> DeltaResult<(Vec<Add>, WriteStreamMetrics)> {
+    write_streams_with_capacity(streams, object_store, config, writer_batch_concurrency()).await
+}
+
+/// [`write_streams`] with an explicit producer→writer channel capacity, so a
+/// caller running many single-stream drains concurrently (the partitioned write
+/// path) can split one global batch budget across them instead of multiplying it.
+pub(crate) async fn write_streams_with_capacity(
+    streams: Vec<SendableRecordBatchStream>,
+    object_store: ObjectStoreRef,
+    config: WriterConfig,
+    channel_capacity: usize,
+) -> DeltaResult<(Vec<Add>, WriteStreamMetrics)> {
+    let worker_count = streams.len();
+    let (tx, rx) = mpsc::channel::<RecordBatch>(channel_capacity.max(1));
+
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let mut cancel_guard = CancelOnDrop {
+        flag: cancelled.clone(),
+        armed: true,
+    };
+
+    let writer_cancelled = cancelled.clone();
+    let mut writer_handle = tokio::task::spawn(async move {
+        let mut writer = DeltaWriter::new(object_store, config);
+        // Drain the channel through the shared timed-write loop
+        // (datafile::writer::write_batches_timed) — the same loop the basic
+        // DeltaDataWriter::write_all uses, so timing/row accounting lives in one place.
+        let batches = futures::stream::unfold(rx, |mut rx| async move {
+            rx.recv()
+                .await
+                .map(|batch| (Ok::<_, DeltaTableError>(batch), rx))
+        })
+        .boxed();
+        let metrics = match write_batches_timed(&mut writer, batches).await {
+            Ok(metrics) => metrics,
+            Err(e) => {
+                // Abort rather than drop: dropping leaks the open multipart uploads.
+                let _ = writer.abort().await;
+                return Err(e);
+            }
+        };
+        // Channel EOF also happens when the producers were torn down by a
+        // cancellation (worker failure, or this drain's future being dropped by
+        // an aborted sibling task). Abort the partial data instead of
+        // finalizing orphan files for a write that already failed.
+        if writer_cancelled.load(AtomicOrdering::Acquire) {
+            let _ = writer.abort().await;
+            return Err(DeltaTableError::Generic(WRITE_CANCELLED_MSG.to_string()));
+        }
+        let adds = writer.close().await?;
+        Ok::<(Vec<Add>, u64, u64), DeltaTableError>((
+            adds,
+            metrics.write_time_ms,
+            metrics.rows_written,
+        ))
+    });
+
+    let mut worker_set = JoinSet::new();
+    for mut stream in streams {
+        let tx_clone = tx.clone();
+        worker_set.spawn(async move {
+            while let Some(maybe_batch) = stream.next().await {
+                let batch = maybe_batch?;
+                tx_clone.send(batch).await.map_err(|_| {
+                    DeltaTableError::Generic(WRITER_TASK_CLOSED_UNEXPECTEDLY_MSG.to_string())
+                })?;
+            }
+            Ok::<(), DeltaTableError>(())
+        });
+    }
+
+    drop(tx);
+
+    let mut worker_error: Option<DeltaTableError> = None;
+    let mut writer_result: Option<DeltaResult<(Vec<Add>, u64, u64)>> = None;
+    let mut workers_remaining = worker_count;
+
+    while workers_remaining > 0 || writer_result.is_none() {
+        tokio::select! {
+            writer_join = &mut writer_handle, if writer_result.is_none() => {
+                let result = writer_join
+                    .map_err(|e| DeltaTableError::Generic(format!("writer join error: {e}")))
+                    .and_then(|join_res| join_res);
+                if result.is_err() && workers_remaining > 0 {
+                    worker_set.abort_all();
+                }
+                writer_result = Some(result);
+            }
+            worker_join = worker_set.join_next(), if workers_remaining > 0 => {
+                let Some(worker_join) = worker_join else {
+                    workers_remaining = 0;
+                    continue;
+                };
+                workers_remaining -= 1;
+
+                match worker_join {
+                    Ok(Ok(())) => {}
+                    Ok(Err(err)) => {
+                        let writer_failed = writer_result.as_ref().is_some_and(Result::is_err);
+                        if worker_error.is_none()
+                            && !(writer_failed && is_writer_task_closed_error(&err))
+                        {
+                            worker_error = Some(err);
+                        }
+                        // Poison the writer before tearing the producers down, so
+                        // it aborts at channel EOF instead of closing partial data.
+                        cancelled.store(true, AtomicOrdering::Release);
+                        worker_set.abort_all();
+                    }
+                    Err(join_err) if join_err.is_cancelled() => {
+                        let writer_failed = writer_result.as_ref().is_some_and(Result::is_err);
+                        if worker_error.is_none() && !writer_failed {
+                            worker_error = Some(DeltaTableError::Generic(format!(
+                                "worker task unexpectedly cancelled while driving partition: {join_err}"
+                            )));
+                            cancelled.store(true, AtomicOrdering::Release);
+                        }
+                    }
+                    Err(join_err) => {
+                        if worker_error.is_none() {
+                            worker_error = Some(DeltaTableError::Generic(format!(
+                                "worker join error when driving partition: {join_err}"
+                            )));
+                        }
+                        cancelled.store(true, AtomicOrdering::Release);
+                        worker_set.abort_all();
+                    }
+                }
+            }
+        }
+    }
+
+    while let Some(worker_join) = worker_set.join_next().await {
+        match worker_join {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => {
+                let writer_failed = writer_result.as_ref().is_some_and(Result::is_err);
+                if worker_error.is_none() && !(writer_failed && is_writer_task_closed_error(&err)) {
+                    worker_error = Some(err);
+                }
+            }
+            Err(join_err) if join_err.is_cancelled() => {}
+            Err(join_err) => {
+                if worker_error.is_none() {
+                    worker_error = Some(DeltaTableError::Generic(format!(
+                        "worker join error when driving partition: {join_err}"
+                    )));
+                }
+            }
+        }
+    }
+
+    // The writer task has finished — there is nothing left for the drop guard to
+    // poison, and disarming it keeps an already-successful close from being
+    // misread as cancelled by a later drain in this task.
+    cancel_guard.armed = false;
+
+    let writer_result = writer_result.ok_or_else(|| {
+        DeltaTableError::Generic("writer task did not produce a result".to_string())
+    })?;
+    let (adds, write_time_ms, rows_written) = match writer_result {
+        Ok(values) => values,
+        // The synthetic cancellation error means a worker failure triggered the
+        // abort; surface the original failure instead of the symptom.
+        Err(err) if is_write_cancelled_error(&err) && worker_error.is_some() => {
+            return Err(worker_error.expect("checked is_some"));
+        }
+        Err(err) => return Err(err),
+    };
+
+    if let Some(err) = worker_error {
+        return Err(err);
+    }
+
+    Ok((
+        adds,
+        WriteStreamMetrics {
+            rows_written,
+            write_time_ms,
+        },
+    ))
+}
+
+/// Hash repartitions the plan by partition columns so each stream
+/// writes to disjoint Delta partitions.
+/// The output partition count is capped by `DELTARS_MAX_CONCURRENT_WRITERS`
+/// Returns the plan unchanged if there is only a single stream.
+fn repartition_by_partition_columns(
+    plan: Arc<dyn ExecutionPlan>,
+    partition_columns: &[String],
+) -> DeltaResult<Arc<dyn ExecutionPlan>> {
+    let original_count = plan.output_partitioning().partition_count();
+
+    if original_count <= 1 {
+        return Ok(plan);
+    }
+
+    let num_partitions = original_count.min(max_concurrent_writers());
+
+    let schema = plan.schema();
+    let hash_exprs = partition_columns
+        .iter()
+        .map(|name| physical_col(name, &schema).map(|e| e as _))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Arc::new(RepartitionExec::try_new(
+        plan,
+        Partitioning::Hash(hash_exprs, num_partitions),
+    )?))
+}
+
+async fn write_data_plan(
+    session: &dyn Session,
+    plan: Arc<dyn ExecutionPlan>,
+    sink_config: WriteSinkConfig,
+) -> DeltaResult<(Vec<Action>, WriteExecutionPlanMetrics)> {
+    let WriteSinkConfig {
+        partition_columns,
+        object_store,
+        props,
+        column_mapping,
+        path_prefix,
+    } = sink_config;
+    let (plan, partition_columns, random_prefix_length) =
+        apply_column_mapping_to_plan(plan, partition_columns, &column_mapping)?;
+    let config = WriterConfig::new(plan.schema().clone(), partition_columns.clone(), props)
+        .with_random_prefix_length(random_prefix_length)
+        .with_path_prefix(path_prefix);
+
+    // For unpartitioned writes, centralize writer behavior through write_streams.
+    if partition_columns.is_empty() {
+        let partition_streams = execute_stream_partitioned(plan, session.task_ctx())?;
+        let scan_start = std::time::Instant::now();
+        let (adds, stream_metrics) = write_streams(partition_streams, object_store, config).await?;
+
+        let scan_time_ms = scan_start
+            .elapsed()
+            .as_millis()
+            .saturating_sub(stream_metrics.write_time_ms as u128) as u64;
+
+        let metrics = WriteExecutionPlanMetrics {
+            scan_time_ms,
+            write_time_ms: stream_metrics.write_time_ms,
+        };
+
+        let actions = adds.into_iter().map(Action::Add).collect::<Vec<_>>();
+        return Ok((actions, metrics));
+    }
+
+    let plan = repartition_by_partition_columns(plan, &partition_columns)?;
+    let partition_streams = execute_stream_partitioned(plan, session.task_ctx())?;
+    let scan_start = std::time::Instant::now();
+
+    // Split the global in-flight batch budget across the concurrent per-partition
+    // drains, so total buffering stays bounded by `writer_batch_concurrency()`
+    // regardless of the partition count.
+    let per_partition_capacity =
+        (writer_batch_concurrency() / partition_streams.len().max(1)).max(1);
+
+    let mut join_set = JoinSet::new();
+    for stream in partition_streams {
+        let store = object_store.clone();
+        let config = config.clone();
+        join_set.spawn(async move {
+            // Each partition drains through the same producer/consumer writer as
+            // the unpartitioned path, so scan and parquet encode+upload overlap
+            // within the partition (and across partitions via the JoinSet).
+            let (adds, metrics) =
+                write_streams_with_capacity(vec![stream], store, config, per_partition_capacity)
+                    .await?;
+            Ok::<(Vec<Add>, u64), DeltaTableError>((adds, metrics.write_time_ms))
+        });
+    }
+
+    let mut all_adds = Vec::new();
+    // Writers run in parallel, so wall-clock write time is the slowest task
+    let mut max_write_ms: u64 = 0;
+    while let Some(join_res) = join_set.join_next().await {
+        let result = join_res
+            .map_err(|e| DeltaTableError::Generic(format!("writer task join error: {e}")))?;
+        match result {
+            Ok((adds, write_ms)) => {
+                all_adds.extend(adds);
+                max_write_ms = max_write_ms.max(write_ms);
+            }
+            Err(e) => {
+                join_set.abort_all();
+                return Err(e);
+            }
+        }
+    }
+
+    let scan_elapsed = scan_start.elapsed().as_millis() as u64;
+    let scan_time_ms = scan_elapsed.saturating_sub(max_write_ms);
+
+    let metrics = WriteExecutionPlanMetrics {
+        scan_time_ms,
+        write_time_ms: max_write_ms,
+    };
+
+    let actions = all_adds.into_iter().map(Action::Add).collect::<Vec<_>>();
+    Ok((actions, metrics))
+}
+
+/// Split a CDC-unioned batch into (normal-write rows, cdf rows) using Arrow compute,
+/// avoiding the overhead of a DataFusion plan-and-execute cycle per batch.
+///
+/// Mirrors the original DataFusion filter semantics exactly:
+/// - **normal side** (written to the data file): rows where `_change_type` is NOT IN
+///   {"delete", "source_delete", "update_preimage"}. The `_change_type` column is stripped.
+/// - **CDF side** (written to `_change_data`): rows where `_change_type` IS IN
+///   {"delete", "insert", "update_preimage", "update_postimage"}.
+///
+/// As in SQL, a null `_change_type` matches neither filter, so the row is dropped from both
+/// sides. Merge relies on this to drop source rows that no insert clause accepts.
+fn split_cdc_batch(batch: &RecordBatch) -> DeltaResult<(RecordBatch, RecordBatch)> {
+    use arrow::array::BooleanArray;
+    use arrow::array::cast::AsArray;
+    use arrow::compute::filter_record_batch;
+
+    let cdc_idx = batch
+        .schema()
+        .index_of(CDC_COLUMN_NAME)
+        .map_err(|_| DeltaTableError::generic("_change_type column not found in CDC batch"))?;
+
+    let change_type_col = batch
+        .column(cdc_idx)
+        .as_string_opt::<i32>()
+        .ok_or_else(|| {
+            DeltaTableError::generic("_change_type column is not a Utf8 string array")
+        })?;
+
+    // Normal side: keep non-delete events and drop a null _change_type.
+    // Mirrors `NOT IN ("delete", "source_delete", "update_preimage")`.
+    let normal_mask: BooleanArray = change_type_col
+        .iter()
+        .map(|v| {
+            v.map(|v| !matches!(v, "delete" | "source_delete" | "update_preimage"))
+                .unwrap_or(false)
+        })
+        .collect();
+
+    let mut normal_batch = filter_record_batch(batch, &normal_mask)
+        .map_err(|e| DeltaTableError::Generic(format!("CDC normal-row filter failed: {e}")))?;
+    // _change_type must not appear in the data file.
+    normal_batch.remove_column(cdc_idx);
+
+    // CDF side: only explicit change events; a null _change_type is dropped.
+    // Mirrors `IN ("delete", "insert", "update_preimage", "update_postimage")`.
+    let cdf_mask: BooleanArray = change_type_col
+        .iter()
+        .map(|v| {
+            v.is_some_and(|v| {
+                matches!(
+                    v,
+                    "delete" | "insert" | "update_preimage" | "update_postimage"
+                )
+            })
+        })
+        .collect();
+    let cdf_batch = filter_record_batch(batch, &cdf_mask)
+        .map_err(|e| DeltaTableError::Generic(format!("CDC cdf-row filter failed: {e}")))?;
+
+    Ok((normal_batch, cdf_batch))
+}
+
+async fn write_cdc_plan(
+    session: &dyn Session,
+    plan: Arc<dyn ExecutionPlan>,
+    sink_config: WriteSinkConfig,
+) -> DeltaResult<(Vec<Action>, WriteExecutionPlanMetrics)> {
+    let WriteSinkConfig {
+        partition_columns,
+        object_store,
+        props,
+        column_mapping,
+        path_prefix,
+    } = sink_config;
+    if path_prefix.is_some() {
+        return Err(DeltaTableError::generic(
+            "a change data write does not take a path prefix: its files go below `_change_data`",
+        ));
+    }
+    let (plan, partition_columns, random_prefix_length) =
+        apply_column_mapping_to_plan(plan, partition_columns, &column_mapping)?;
+    // Change data goes below `_change_data` in the same store, so paths come back table-relative.
+    let cdf_store = object_store.clone();
+
+    let write_schema = Arc::new(Schema::new(
+        plan.schema()
+            .clone()
+            .fields()
+            .into_iter()
+            .filter_map(|f| {
+                if f.name() != CDC_COLUMN_NAME {
+                    Some(f.as_ref().clone())
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>(),
+    ));
+    let cdf_schema = plan.schema().clone();
+
+    // One budget for both destinations of a change-data write.
+    let upload_budget = UploadBudget::for_write(props.target_file_size());
+    let normal_config = WriterConfig::new(
+        write_schema.clone(),
+        partition_columns.clone(),
+        props.clone(),
+    )
+    .with_random_prefix_length(random_prefix_length)
+    .with_upload_budget(upload_budget.clone());
+
+    let cdf_config = WriterConfig::new(cdf_schema.clone(), partition_columns.clone(), props)
+        .with_random_prefix_length(random_prefix_length)
+        .with_path_prefix(Some(Path::from(CHANGE_DATA_DIR)))
+        .with_upload_budget(upload_budget);
+
+    // Keep the previous single-writer fan-in path for unpartitioned tables.
+    if partition_columns.is_empty() {
+        let (tx_normal, mut rx_normal) = mpsc::channel::<RecordBatch>(writer_batch_concurrency());
+        let (tx_cdf, mut rx_cdf) = mpsc::channel::<RecordBatch>(writer_batch_concurrency());
+
+        let normal_writer_handle = tokio::task::spawn(async move {
+            let mut writer = DeltaWriter::new(object_store, normal_config);
+            let mut total_write_ms: u64 = 0;
+            while let Some(batch) = rx_normal.recv().await {
+                let wstart = std::time::Instant::now();
+                writer.write(&batch).await?;
+                total_write_ms += wstart.elapsed().as_millis() as u64;
+            }
+            let adds = writer.close().await?;
+            Ok::<(Vec<Add>, u64), DeltaTableError>((adds, total_write_ms))
+        });
+
+        let cdf_writer_handle = tokio::task::spawn(async move {
+            let mut writer = DeltaWriter::new(cdf_store, cdf_config);
+            let mut total_write_ms: u64 = 0;
+            while let Some(batch) = rx_cdf.recv().await {
+                let wstart = std::time::Instant::now();
+                writer.write(&batch).await?;
+                total_write_ms += wstart.elapsed().as_millis() as u64;
+            }
+            let adds = writer.close().await?;
+            Ok::<(Vec<Add>, u64), DeltaTableError>((adds, total_write_ms))
+        });
+
+        let partition_streams = execute_stream_partitioned(plan, session.task_ctx())?;
+        let mut worker_handles = Vec::with_capacity(partition_streams.len());
+        let scan_start = std::time::Instant::now();
+
+        for mut partition_stream in partition_streams {
+            let txn = tx_normal.clone();
+            let txc = tx_cdf.clone();
+
+            let h = tokio::task::spawn(async move {
+                while let Some(maybe_batch) = partition_stream.next().await {
+                    let batch = maybe_batch?;
+                    let (normal_batch, cdf_batch) = split_cdc_batch(&batch)?;
+                    txn.send(normal_batch).await.map_err(|_| {
+                        DeltaTableError::Generic("normal writer closed unexpectedly".to_string())
+                    })?;
+                    txc.send(cdf_batch).await.map_err(|_| {
+                        DeltaTableError::Generic("cdf writer closed unexpectedly".to_string())
+                    })?;
+                }
+                Ok::<(), DeltaTableError>(())
+            });
+
+            worker_handles.push(h);
+        }
+
+        drop(tx_normal);
+        drop(tx_cdf);
+
+        let normal_join = normal_writer_handle
+            .await
+            .map_err(|e| DeltaTableError::Generic(format!("normal writer join error: {e}")))?;
+        let (normal_adds, normal_write_ms) = match normal_join {
+            Ok(ok) => ok,
+            Err(e) => {
+                cdf_writer_handle.abort();
+                for handle in &worker_handles {
+                    handle.abort();
+                }
+                for handle in worker_handles {
+                    let _ = handle.await;
+                }
+                return Err(e);
+            }
+        };
+
+        let cdf_join = cdf_writer_handle
+            .await
+            .map_err(|e| DeltaTableError::Generic(format!("cdf writer join error: {e}")))?;
+        let (cdf_adds, cdf_write_ms) = match cdf_join {
+            Ok(ok) => ok,
+            Err(e) => {
+                for handle in &worker_handles {
+                    handle.abort();
+                }
+                for handle in worker_handles {
+                    let _ = handle.await;
+                }
+                return Err(e);
+            }
+        };
+
+        for h in worker_handles {
+            let join_res = h.await.map_err(|e| {
+                DeltaTableError::Generic(format!("worker join error when driving partition: {e}"))
+            })?;
+            join_res?;
+        }
+
+        let mut actions = normal_adds.into_iter().map(Action::Add).collect::<Vec<_>>();
+        let mut cdf_actions = cdf_adds.into_iter().map(add_cdc_file).collect::<Vec<_>>();
+        actions.append(&mut cdf_actions);
+
+        let write_time_ms = normal_write_ms + cdf_write_ms;
+        let scan_elapsed = scan_start.elapsed().as_millis() as u64;
+        let scan_time_ms = scan_elapsed.saturating_sub(write_time_ms);
+
+        let metrics = WriteExecutionPlanMetrics {
+            scan_time_ms,
+            write_time_ms,
+        };
+
+        return Ok((actions, metrics));
+    }
+
+    let plan = repartition_by_partition_columns(plan, &partition_columns)?;
+    let partition_streams = execute_stream_partitioned(plan, session.task_ctx())?;
+    let scan_start = std::time::Instant::now();
+    let mut join_set = JoinSet::new();
+
+    for mut stream in partition_streams {
+        let store = object_store.clone();
+        let cdf_store: ObjectStoreRef = cdf_store.clone();
+        let normal_config = normal_config.clone();
+        let cdf_config = cdf_config.clone();
+
+        join_set.spawn(async move {
+            let mut normal_writer = DeltaWriter::new(store, normal_config);
+            let mut cdf_writer = DeltaWriter::new(cdf_store, cdf_config);
+            let mut write_ms: u64 = 0;
+
+            while let Some(maybe_batch) = stream.next().await {
+                let batch = maybe_batch?;
+                let (normal_batch, cdf_batch) = split_cdc_batch(&batch)?;
+
+                let wstart = std::time::Instant::now();
+                normal_writer.write(&normal_batch).await?;
+                cdf_writer.write(&cdf_batch).await?;
+                write_ms += wstart.elapsed().as_millis() as u64;
+            }
+
+            let normal_adds = normal_writer.close().await?;
+            let cdf_adds = cdf_writer.close().await?;
+            Ok::<(Vec<Add>, Vec<Add>, u64), DeltaTableError>((normal_adds, cdf_adds, write_ms))
+        });
+    }
+
+    let mut all_actions = Vec::new();
+    // Writers run in parallel, so wall-clock write time is the slowest task
+    let mut max_write_ms: u64 = 0;
+    while let Some(join_res) = join_set.join_next().await {
+        let result = join_res
+            .map_err(|e| DeltaTableError::Generic(format!("writer task join error: {e}")))?;
+        match result {
+            Ok((normal_adds, cdf_adds, write_ms)) => {
+                all_actions.extend(normal_adds.into_iter().map(Action::Add));
+                all_actions.extend(cdf_adds.into_iter().map(add_cdc_file));
+                max_write_ms = max_write_ms.max(write_ms);
+            }
+            Err(e) => {
+                join_set.abort_all();
+                return Err(e);
+            }
+        }
+    }
+
+    let scan_elapsed = scan_start.elapsed().as_millis() as u64;
+    let scan_time_ms = scan_elapsed.saturating_sub(max_write_ms);
+
+    let metrics = WriteExecutionPlanMetrics {
+        scan_time_ms,
+        write_time_ms: max_write_ms,
+    };
+
+    Ok((all_actions, metrics))
+}

@@ -1,0 +1,138 @@
+[build-system]
+requires = ["maturin>=1,<2"]
+build-backend = "maturin"
+
+[project]
+name = "deltalake"
+description = "Native Delta Lake Python binding based on delta-rs with Pandas integration"
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.11"
+keywords = ["deltalake", "delta", "datalake", "pandas", "arrow"]
+classifiers = [
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+]
+dynamic = ["version"]
+dependencies = ["arro3-core>=0.5.0", "deprecated>=1.2.18"]
+
+[project.optional-dependencies]
+pandas = ["pandas"]
+pyarrow = ["pyarrow>=21"]
+
+[project.urls]
+documentation = "https://delta-io.github.io/delta-rs/"
+repository = "https://github.com/delta-io/delta-rs/tree/main/python/"
+
+[tool.maturin]
+profile = "dev"
+module-name = "deltalake._internal"
+
+[tool.mypy]
+files = "deltalake/*.py"
+exclude = "^tests"
+mypy_path = "./stubs"
+disallow_any_generics = true
+disallow_subclassing_any = true
+disallow_untyped_calls = true
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+check_untyped_defs = true
+disallow_untyped_decorators = true
+no_implicit_optional = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+warn_return_any = false
+implicit_reexport = true
+strict_equality = true
+
+[tool.ruff.lint]
+select = [
+    # pycodestyle error
+    "E",
+    # pyflakes
+    "F",
+    # isort
+    "I",
+    # ruff-specific rules
+    "RUF",
+    "ANN",
+]
+ignore = ["E501", "ANN401", "RUF040"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["ANN"]
+"docs/**" = ["ANN"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["deltalake"]
+
+[tool.pytest.ini_options]
+addopts = "-v -x -m 'not integration and not benchmark and not no_pyarrow'"
+testpaths = ["tests", "deltalake"]
+markers = [
+    "integration: marks tests as integration tests (deselect with '-m \"not integration\"')",
+    "s3: marks tests as integration tests with S3 (deselect with '-m \"not s3\"')",
+    "azure: marks tests as integration tests with Azure Blob Store",
+    "benchmark: marks tests as benchmark tests (deselect with '-m \"not benchmark\"')",
+    "pandas: marks tests that require pandas",
+    "polars: marks tests that require polars",
+    "lakefs: marks tests that require lakefs",
+    "pyarrow: marks tests that require pyarrow",
+    "no_pyarrow: marks tests that test deltalake functionality without pyarrow",
+    "opentelemetry: marks tests that require opentelemetry",
+    "unitycatalog_databricks: marks tests that require unitycatalog_databricks",
+    "unitycatalog_oss: marks tests that require unitycatalog_oss",
+    "pyspark: marks tests that require pyspark",
+    "datafusion: marks tests that require datafusion"
+]
+
+[tool.coverage.run]
+branch = true
+source = ["deltalake"]
+
+[dependency-groups]
+dev = [
+    "arro3-io",
+    "pytest",
+    "pytest-benchmark",
+    "pytest-cov",
+    "pytest-mock",
+    "pytest-timeout",
+    "pytest-xdist",
+    "mypy==1.10.1",
+    "ruff>=0.11.2,<0.11.12",
+    "types-deprecated>=1.2.15.20250304",
+    "testcontainers[minio]>=4.13.0",
+]
+opentelemetry = ["opentelemetry-sdk>=1.20.0", "opentelemetry-api>=1.20.0"]
+polars = ["polars==1.44.2"]
+lakefs = ["lakefs==0.8.0"]
+pyspark = [
+    "pyspark==4.2.0",
+    "delta-spark",
+    "pandas<3",
+]
+other = [
+    "azure-storage-blob==12.20.0",
+    "packaging>=20",
+    "toml",
+    "wheel",
+    "pip>=24.0",
+]
+# For bench/streamed_merge, which needs LazyFrame.sink_delta (Polars 1.37 or newer).
+bench = [
+    { include-group = "polars" },
+    "duckdb",
+    # The version comes from the pyarrow extra.
+    "pyarrow",
+    "great_tables>=0.24",
+    "reactable>=0.1.6",
+]
+
+[tool.uv]
+# Re-enable a Python DataFusion dependency group once DataFusion 55 wheels are published.
+default-groups = ["dev", "opentelemetry", "polars", "lakefs", "other"]

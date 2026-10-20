@@ -1,0 +1,49 @@
+[package]
+name = "delta-benchmarks"
+version = "0.0.1"
+authors = ["David Blajda <db@davidblajda.com>"]
+homepage = "https://github.com/delta-io/delta.rs"
+license = "Apache-2.0"
+keywords = ["deltalake", "delta", "datalake"]
+description = "Delta-rs Benchmarks"
+edition = "2021"
+publish = false
+
+[dependencies]
+async-trait = { workspace = true }
+clap = { version = "4", features = ["derive", "env"] }
+tokio = { workspace = true, features = ["fs", "macros", "rt", "io-util", "time"] }
+url = { workspace = true }
+tempfile = { workspace = true }
+chrono = { workspace = true, default-features = false, features = ["clock"] }
+futures = { workspace = true }
+object_store = { workspace = true }
+anyhow = "1"
+
+[dependencies.deltalake-core]
+path = "../core"
+version = "2"
+features = ["datafusion"]
+
+[dev-dependencies]
+divan = "0.1"
+
+[[bench]]
+name = "merge"
+harness = false
+
+[[bench]]
+name = "smoke"
+harness = false
+
+[[bench]]
+name = "write"
+harness = false
+
+[[bench]]
+name = "tpcds"
+harness = false
+
+[[bench]]
+name = "vacuum"
+harness = false

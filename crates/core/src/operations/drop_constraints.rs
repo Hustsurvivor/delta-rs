@@ -1,0 +1,203 @@
+//! Drop a constraint from a table
+
+use futures::future::BoxFuture;
+
+use crate::DeltaTable;
+use crate::kernel::transaction::{CommitProperties, PROTOCOL};
+use crate::kernel::{Action, EagerSnapshot, MetadataExt, SnapshotMetadataRef, resolve_snapshot};
+use crate::logstore::LogStoreRef;
+use crate::operations::commit_actions_in_scope;
+use crate::protocol::DeltaOperation;
+use crate::table::state::DeltaTableState;
+use crate::{DeltaResult, DeltaTableError};
+
+/// Remove constraints from the table
+pub struct DropConstraintBuilder {
+    /// A snapshot of the table's state
+    snapshot: Option<EagerSnapshot>,
+    /// Name of the constraint
+    name: Option<String>,
+    /// Raise if constraint doesn't exist
+    raise_if_not_exists: bool,
+    /// Delta object store for handling data files
+    log_store: LogStoreRef,
+    /// Additional information to add to the commit
+    commit_properties: CommitProperties,
+}
+
+impl DropConstraintBuilder {
+    /// Create a new builder
+    pub(crate) fn new(log_store: LogStoreRef, snapshot: Option<EagerSnapshot>) -> Self {
+        Self {
+            name: None,
+            raise_if_not_exists: true,
+            snapshot,
+            log_store,
+            commit_properties: CommitProperties::default(),
+        }
+    }
+
+    /// Specify the constraint to be removed
+    pub fn with_constraint<S: Into<String>>(mut self, name: S) -> Self {
+        self.name = Some(name.into());
+        self
+    }
+
+    /// Specify if you want to raise if the constraint does not exist
+    pub fn with_raise_if_not_exists(mut self, raise: bool) -> Self {
+        self.raise_if_not_exists = raise;
+        self
+    }
+
+    /// Additional metadata to be added to commit info
+    pub fn with_commit_properties(mut self, commit_properties: CommitProperties) -> Self {
+        self.commit_properties = commit_properties;
+        self
+    }
+}
+
+fn plan_drop_constraint_actions(
+    snapshot: SnapshotMetadataRef<'_>,
+    name: &str,
+    raise_if_not_exists: bool,
+) -> DeltaResult<Option<(Vec<Action>, DeltaOperation)>> {
+    let mut metadata = snapshot.metadata.clone();
+    let configuration_key = format!("delta.constraints.{name}");
+
+    if !metadata.configuration().contains_key(&configuration_key) {
+        if raise_if_not_exists {
+            return Err(DeltaTableError::Generic(format!(
+                "Constraint with name '{name}' does not exist."
+            )));
+        }
+        return Ok(None);
+    }
+
+    metadata = metadata.remove_config_key(&configuration_key)?;
+    let operation = DeltaOperation::DropConstraint {
+        name: name.to_string(),
+    };
+
+    Ok(Some((vec![Action::Metadata(metadata)], operation)))
+}
+
+impl std::future::IntoFuture for DropConstraintBuilder {
+    type Output = DeltaResult<DeltaTable>;
+
+    type IntoFuture = BoxFuture<'static, Self::Output>;
+
+    fn into_future(self) -> Self::IntoFuture {
+        let this = self;
+
+        Box::pin(async move {
+            let snapshot = resolve_snapshot(&this.log_store, this.snapshot.clone(), None).await?;
+            PROTOCOL.can_write_to(&snapshot)?;
+
+            let name = this
+                .name
+                .clone()
+                .ok_or(DeltaTableError::Generic("No name provided".to_string()))?;
+
+            let Some((actions, operation)) = plan_drop_constraint_actions(
+                snapshot.snapshot().metadata_state(),
+                &name,
+                this.raise_if_not_exists,
+            )?
+            else {
+                return Ok(DeltaTable::new_with_state(
+                    this.log_store,
+                    DeltaTableState::new(snapshot),
+                ));
+            };
+
+            commit_actions_in_scope(
+                &this.log_store,
+                &snapshot,
+                this.commit_properties,
+                actions,
+                operation,
+            )
+            .await
+        })
+    }
+}
+
+#[cfg(feature = "datafusion")]
+#[cfg(test)]
+mod tests {
+    use crate::writer::test_utils::{create_bare_table, get_record_batch};
+    use crate::{DeltaResult, DeltaTable};
+
+    async fn get_constraint_op_params(table: &mut DeltaTable) -> String {
+        let last_commit = table.last_commit().await.unwrap();
+
+        last_commit
+            .operation_parameters
+            .as_ref()
+            .unwrap()
+            .get("name")
+            .unwrap()
+            .as_str()
+            .unwrap()
+            .to_owned()
+    }
+
+    #[tokio::test]
+    async fn drop_valid_constraint() -> DeltaResult<()> {
+        let batch = get_record_batch(None, false);
+        let table = create_bare_table().write(vec![batch.clone()]).await?;
+
+        let table = table
+            .add_constraint()
+            .with_constraint("id", "value < 1000")
+            .await?;
+
+        let mut table = table.drop_constraints().with_constraint("id").await?;
+
+        let expected_name = "id";
+        assert_eq!(get_constraint_op_params(&mut table).await, expected_name);
+        assert_eq!(
+            table
+                .snapshot()
+                .unwrap()
+                .metadata()
+                .configuration()
+                .get("id"),
+            None
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn drop_invalid_constraint_not_existing() -> DeltaResult<()> {
+        let batch = get_record_batch(None, false);
+        let write = create_bare_table().write(vec![batch.clone()]).await?;
+
+        let table = write
+            .drop_constraints()
+            .with_constraint("not_existing")
+            .await;
+        assert!(table.is_err());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn drop_invalid_constraint_ignore() -> DeltaResult<()> {
+        let batch = get_record_batch(None, false);
+        let write = create_bare_table().write(vec![batch.clone()]).await?;
+
+        let version = write.version();
+
+        let table = write
+            .drop_constraints()
+            .with_constraint("not_existing")
+            .with_raise_if_not_exists(false)
+            .await?;
+
+        let version_after = table.version();
+
+        assert_eq!(version, version_after);
+        Ok(())
+    }
+}

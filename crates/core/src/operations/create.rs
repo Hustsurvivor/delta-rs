@@ -1,0 +1,822 @@
+//! Command for creating a new delta table
+// https://github.com/delta-io/delta/blob/master/core/src/main/scala/org/apache/spark/sql/delta/commands/CreateDeltaTableCommand.scala
+
+use std::collections::HashMap;
+
+use delta_kernel::schema::{ColumnMetadataKey, MetadataValue};
+use delta_kernel::table_features::{ColumnMappingMode, assign_column_mapping_metadata};
+use futures::TryStreamExt as _;
+use futures::future::BoxFuture;
+use serde_json::Value;
+
+use crate::errors::{ColumnMappingOperation, DeltaResult, DeltaTableError};
+use crate::kernel::transaction::{CommitBuilder, CommitProperties, TableReference};
+use crate::kernel::{Action, DataType, MetadataExt, ProtocolExt as _, StructField, StructType};
+use crate::kernel::{ProtocolInner, new_metadata};
+use crate::logstore::LogStoreRef;
+use crate::logstore::with_operation;
+use crate::protocol::{DeltaOperation, SaveMode};
+use crate::table::builder::ensure_table_uri;
+use crate::table::config::TableProperty;
+use crate::table::normalize_table_url;
+use crate::{DeltaTable, DeltaTableBuilder};
+
+#[derive(thiserror::Error, Debug)]
+enum CreateError {
+    #[error("Location must be provided to create a table.")]
+    MissingLocation,
+
+    #[error("At least one column must be defined to create a table.")]
+    MissingSchema,
+
+    #[error("Please configure table meta data via the CreateBuilder.")]
+    MetadataSpecified,
+
+    #[error("A Delta Lake table already exists at that location.")]
+    TableAlreadyExists,
+
+    #[error("SaveMode `append` is not allowed for create operation.")]
+    AppendNotAllowed,
+}
+
+impl From<CreateError> for DeltaTableError {
+    fn from(err: CreateError) -> Self {
+        DeltaTableError::GenericError {
+            source: Box::new(err),
+        }
+    }
+}
+
+fn data_type_has_column_mapping_metadata(data_type: &DataType) -> bool {
+    match data_type {
+        DataType::Array(array) => data_type_has_column_mapping_metadata(array.element_type()),
+        DataType::Map(map) => {
+            data_type_has_column_mapping_metadata(map.key_type())
+                || data_type_has_column_mapping_metadata(map.value_type())
+        }
+        DataType::Struct(fields) | DataType::Variant(fields) => {
+            fields.fields().any(field_has_column_mapping_metadata)
+        }
+        DataType::Primitive(_) => false,
+    }
+}
+
+fn field_has_column_mapping_metadata(field: &StructField) -> bool {
+    field
+        .metadata()
+        .contains_key(ColumnMetadataKey::ColumnMappingId.as_ref())
+        || field
+            .metadata()
+            .contains_key(ColumnMetadataKey::ColumnMappingPhysicalName.as_ref())
+        || data_type_has_column_mapping_metadata(field.data_type())
+}
+
+/// Build an operation to create a new [DeltaTable]
+/// Build an operation to create a new [DeltaTable]
+#[derive(Clone)]
+pub struct CreateBuilder {
+    name: Option<String>,
+    location: Option<String>,
+    mode: SaveMode,
+    comment: Option<String>,
+    columns: Vec<StructField>,
+    partition_columns: Option<Vec<String>>,
+    storage_options: Option<HashMap<String, String>>,
+    actions: Vec<Action>,
+    log_store: Option<LogStoreRef>,
+    configuration: HashMap<String, Option<String>>,
+    /// Additional information to add to the commit
+    commit_properties: CommitProperties,
+    raise_if_key_not_exists: bool,
+}
+
+impl Default for CreateBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl CreateBuilder {
+    /// Create a new [`CreateBuilder`]
+    pub fn new() -> Self {
+        Self {
+            name: None,
+            location: None,
+            mode: SaveMode::ErrorIfExists,
+            comment: None,
+            columns: Default::default(),
+            partition_columns: None,
+            storage_options: None,
+            actions: Default::default(),
+            log_store: None,
+            configuration: Default::default(),
+            commit_properties: CommitProperties::default(),
+            raise_if_key_not_exists: true,
+        }
+    }
+
+    /// Specify the table name. Optionally qualified with
+    /// a database name [database_name.] table_name.
+    pub fn with_table_name(mut self, name: impl Into<String>) -> Self {
+        self.name = Some(name.into());
+        self
+    }
+
+    /// Specify the path to the location where table data is stored,
+    /// which could be a path on distributed storage.
+    pub fn with_location(mut self, location: impl Into<String>) -> Self {
+        self.location = Some(location.into());
+        self
+    }
+
+    /// Specify the behavior when a table exists at location
+    pub fn with_save_mode(mut self, save_mode: SaveMode) -> Self {
+        self.mode = save_mode;
+        self
+    }
+
+    /// Comment to describe the table.
+    pub fn with_comment(mut self, comment: impl Into<String>) -> Self {
+        self.comment = Some(comment.into());
+        self
+    }
+
+    /// Specify a column in the table
+    pub fn with_column(
+        mut self,
+        name: impl Into<String>,
+        data_type: DataType,
+        nullable: bool,
+        metadata: Option<HashMap<String, Value>>,
+    ) -> Self {
+        let mut field = StructField::new(name.into(), data_type, nullable);
+        if let Some(meta) = metadata {
+            field = field.with_metadata(meta.iter().map(|(k, v)| {
+                (
+                    k,
+                    if let Value::Number(n) = v {
+                        n.as_i64().map_or_else(
+                            || MetadataValue::String(v.to_string()),
+                            MetadataValue::Number,
+                        )
+                    } else {
+                        MetadataValue::String(v.to_string())
+                    },
+                )
+            }));
+        };
+        self.columns.push(field);
+        self
+    }
+
+    /// Specify columns to append to schema
+    pub fn with_columns(
+        mut self,
+        columns: impl IntoIterator<Item = impl Into<StructField>>,
+    ) -> Self {
+        self.columns.extend(columns.into_iter().map(|c| c.into()));
+        self
+    }
+
+    /// Specify table partitioning
+    pub fn with_partition_columns(
+        mut self,
+        partition_columns: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        self.partition_columns = Some(partition_columns.into_iter().map(|s| s.into()).collect());
+        self
+    }
+
+    /// Set options used to initialize storage backend
+    ///
+    /// Options may be passed in the HashMap or set as environment variables.
+    ///
+    /// [crate::table::builder::s3_storage_options] describes the available options for the AWS or S3-compliant backend.
+    /// If an object store is also passed using `with_object_store()` these options will be ignored.
+    pub fn with_storage_options(mut self, storage_options: HashMap<String, String>) -> Self {
+        self.storage_options = Some(storage_options);
+        self
+    }
+
+    /// Set configuration on created table
+    pub fn with_configuration(
+        mut self,
+        configuration: impl IntoIterator<Item = (impl Into<String>, Option<impl Into<String>>)>,
+    ) -> Self {
+        // Parse configuration to extract version requirements
+        for (key, value) in configuration.into_iter() {
+            let key_str = key.into();
+
+            if let Some(value) = value {
+                let v: String = value.into();
+                self.configuration.insert(key_str, Some(v));
+            }
+        }
+
+        self
+    }
+
+    /// Specify a table property in the table configuration
+    pub fn with_configuration_property(
+        mut self,
+        key: TableProperty,
+        value: Option<impl Into<String>>,
+    ) -> Self {
+        self.configuration
+            .insert(key.as_ref().into(), value.map(|v| v.into()));
+        self
+    }
+
+    /// Additional metadata to be added to commit info
+    pub fn with_commit_properties(mut self, commit_properties: CommitProperties) -> Self {
+        self.commit_properties = commit_properties;
+        self
+    }
+
+    /// Specify whether to raise an error if the table properties in the configuration are not TableProperties
+    pub fn with_raise_if_key_not_exists(mut self, raise_if_key_not_exists: bool) -> Self {
+        self.raise_if_key_not_exists = raise_if_key_not_exists;
+        self
+    }
+
+    /// Specify additional actions to be added to the commit.
+    ///
+    /// This method is mainly meant for internal use. Manually adding inconsistent
+    /// actions to a create operation may have undesired effects - use with caution.
+    pub fn with_actions(mut self, actions: impl IntoIterator<Item = Action>) -> Self {
+        self.actions.extend(actions);
+        self
+    }
+
+    /// Provide a [`LogStore`] instance
+    pub fn with_log_store(mut self, log_store: LogStoreRef) -> Self {
+        self.log_store = Some(log_store);
+        self
+    }
+
+    /// Consume self into uninitialized table with corresponding create actions and operation meta
+    pub(crate) async fn into_table_and_actions(
+        self,
+    ) -> DeltaResult<(DeltaTable, Vec<Action>, DeltaOperation)> {
+        if self
+            .actions
+            .iter()
+            .any(|a| matches!(a, Action::Metadata(_)))
+        {
+            return Err(CreateError::MetadataSpecified.into());
+        }
+        if self.columns.is_empty() {
+            return Err(CreateError::MissingSchema.into());
+        }
+        if self.columns.iter().any(field_has_column_mapping_metadata) {
+            return Err(DeltaTableError::unsupported_column_mapping(
+                ColumnMappingOperation::Write,
+                "CREATE TABLE with column mapping metadata",
+            ));
+        }
+
+        let (storage_url, table) = if let Some(log_store) = self.log_store {
+            (
+                normalize_table_url(log_store.root_url()),
+                DeltaTable::new(log_store),
+            )
+        } else {
+            let storage_url =
+                ensure_table_uri(self.location.clone().ok_or(CreateError::MissingLocation)?)?;
+            (
+                storage_url.clone(),
+                DeltaTableBuilder::from_url(storage_url)?
+                    .with_storage_options(self.storage_options.clone().unwrap_or_default())
+                    .build()?,
+            )
+        };
+
+        let mut configuration: HashMap<String, String> = self
+            .configuration
+            .iter()
+            .filter_map(|(k, v)| Some((k.to_string(), v.as_ref()?.to_string())))
+            .collect();
+
+        let protocol = self
+            .actions
+            .iter()
+            .find(|a| matches!(a, Action::Protocol(_)))
+            .map(|a| match a {
+                Action::Protocol(p) => p.clone(),
+                _ => unreachable!(),
+            })
+            .unwrap_or_else(|| ProtocolInner::default().as_kernel());
+
+        let schema = StructType::try_new(self.columns)?;
+
+        let protocol = protocol
+            .apply_properties_to_protocol(&configuration, self.raise_if_key_not_exists)?
+            .apply_column_metadata_to_protocol(&schema)?
+            .move_table_properties_into_features(&configuration);
+
+        // Column mapping: when creating a column-mapped table, assign a physical name + id to every (nested) field, record the high-water mark
+        let column_mapping_mode = match configuration.get(TableProperty::ColumnMappingMode.as_ref())
+        {
+            Some(mode) => mode.parse::<ColumnMappingMode>().map_err(|_| {
+                DeltaTableError::Generic(format!("Invalid delta.columnMapping.mode: {mode}"))
+            })?,
+            None => ColumnMappingMode::None,
+        };
+        let schema = if matches!(
+            column_mapping_mode,
+            ColumnMappingMode::Name | ColumnMappingMode::Id
+        ) {
+            // The guard above (field_has_column_mapping_metadata) rejects schemas that carry any
+            // pre-existing CM annotations, so there are no existing ids to scan — start from 0.
+            let mut max_id: i64 = 0;
+            let mapped = assign_column_mapping_metadata(&schema, &mut max_id, false)?;
+            configuration.insert(
+                "delta.columnMapping.maxColumnId".to_string(),
+                max_id.to_string(),
+            );
+            mapped
+        } else {
+            schema
+        };
+
+        let mut metadata = new_metadata(
+            &schema,
+            self.partition_columns.unwrap_or_default(),
+            configuration,
+        )?;
+        if let Some(name) = self.name {
+            metadata = metadata.with_name(name)?;
+        }
+        if let Some(comment) = self.comment {
+            metadata = metadata.with_description(comment)?;
+        }
+
+        let operation = DeltaOperation::Create {
+            mode: self.mode,
+            metadata: metadata.clone(),
+            location: storage_url,
+            protocol: protocol.clone(),
+        };
+
+        let mut actions = vec![Action::Protocol(protocol), Action::Metadata(metadata)];
+
+        actions.extend(
+            self.actions
+                .into_iter()
+                .filter(|a| !matches!(a, Action::Protocol(_))),
+        );
+
+        Ok((table, actions, operation))
+    }
+}
+
+impl std::future::IntoFuture for CreateBuilder {
+    type Output = DeltaResult<DeltaTable>;
+    type IntoFuture = BoxFuture<'static, Self::Output>;
+
+    fn into_future(self) -> Self::IntoFuture {
+        let this = self;
+        Box::pin(async move {
+            let mode = &this.mode;
+            let (mut table, mut actions, operation) = this.clone().into_table_and_actions().await?;
+
+            let table_state = if table.log_store.is_delta_table_location().await? {
+                match mode {
+                    SaveMode::ErrorIfExists => return Err(CreateError::TableAlreadyExists.into()),
+                    SaveMode::Append => return Err(CreateError::AppendNotAllowed.into()),
+                    SaveMode::Ignore => {
+                        table.load().await?;
+                        return Ok(table);
+                    }
+                    SaveMode::Overwrite => {
+                        table.load().await?;
+                        let remove_actions = table
+                            .snapshot()?
+                            .snapshot()
+                            .file_views(&table.log_store(), None)
+                            .map_ok(|p| p.remove_action(true).into())
+                            .try_collect::<Vec<_>>()
+                            .await?;
+                        actions.extend(remove_actions);
+                        Some(table.snapshot()?)
+                    }
+                }
+            } else {
+                None
+            };
+
+            // The write scope opens after every early return above, so a table that already
+            // exists never leaves a stale isolated write set behind.
+            let parent = table.log_store();
+            let commit_properties = this.commit_properties.clone();
+            let version = with_operation(&parent, |log_store| async move {
+                Ok(CommitBuilder::from(commit_properties)
+                    .with_actions(actions)
+                    .build(
+                        table_state.map(|f| f as &dyn TableReference),
+                        log_store,
+                        operation,
+                    )
+                    .await?
+                    .version())
+            })
+            .await?;
+            table.load_version(version).await?;
+            Ok(table)
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::kernel::transaction::PROTOCOL;
+    use crate::table::config::TableProperty;
+    use crate::writer::test_utils::get_delta_schema;
+    use delta_kernel::table_features::TableFeature;
+    use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn test_create() {
+        let table_schema = get_delta_schema();
+
+        let table = DeltaTable::new_in_memory()
+            .create()
+            .with_columns(table_schema.fields().cloned())
+            .with_save_mode(SaveMode::Ignore)
+            .await
+            .unwrap();
+        assert_eq!(table.version(), Some(0));
+        assert_eq!(table.snapshot().unwrap().schema().as_ref(), &table_schema)
+    }
+
+    #[tokio::test]
+    async fn test_create_local_relative_path() {
+        let table_schema = get_delta_schema();
+        let tmp_dir = TempDir::new_in(".").unwrap();
+        let relative_path = format!(
+            "./{}",
+            tmp_dir.path().file_name().unwrap().to_str().unwrap()
+        );
+        let table_path = std::path::Path::new(&relative_path).canonicalize().unwrap();
+        let table_url = url::Url::from_directory_path(table_path)
+            .map_err(|_| DeltaTableError::InvalidTableLocation(relative_path.clone()))
+            .unwrap();
+        let table = DeltaTable::try_from_url(table_url)
+            .await
+            .unwrap()
+            .create()
+            .with_columns(table_schema.fields().cloned())
+            .with_save_mode(SaveMode::Ignore)
+            .await
+            .unwrap();
+        assert_eq!(table.version(), Some(0));
+        assert_eq!(table.snapshot().unwrap().schema().as_ref(), &table_schema)
+    }
+
+    #[tokio::test]
+    async fn test_create_table_local_path() {
+        let schema = get_delta_schema();
+        let tmp_dir = TempDir::new_in(".").unwrap();
+        let relative_path = format!(
+            "./{}",
+            tmp_dir.path().file_name().unwrap().to_str().unwrap()
+        );
+        let table = CreateBuilder::new()
+            .with_location(format!("./{relative_path}"))
+            .with_columns(schema.fields().cloned())
+            .await
+            .unwrap();
+        assert_eq!(table.version(), Some(0));
+    }
+
+    #[tokio::test]
+    async fn test_create_table_metadata() {
+        let schema = get_delta_schema();
+        let table = CreateBuilder::new()
+            .with_location("memory:///")
+            .with_columns(schema.fields().cloned())
+            .await
+            .unwrap();
+        let snapshot = table.snapshot().unwrap();
+        assert_eq!(snapshot.version(), 0);
+        assert_eq!(
+            snapshot.protocol().min_reader_version(),
+            PROTOCOL.default_reader_version()
+        );
+        assert_eq!(
+            snapshot.protocol().min_writer_version(),
+            PROTOCOL.default_writer_version()
+        );
+        assert_eq!(snapshot.schema().as_ref(), &schema);
+
+        // check we can overwrite default settings via adding actions
+        let protocol = crate::kernel::ProtocolInner {
+            min_reader_version: 1,
+            min_writer_version: 2,
+            writer_features: None,
+            reader_features: None,
+        }
+        .as_kernel();
+        let table = CreateBuilder::new()
+            .with_location("memory:///")
+            .with_columns(schema.fields().cloned())
+            .with_actions(vec![Action::Protocol(protocol)])
+            .await
+            .unwrap();
+        let snapshot = table.snapshot().unwrap();
+        assert_eq!(snapshot.protocol().min_reader_version(), 1);
+        assert_eq!(snapshot.protocol().min_writer_version(), 2);
+
+        let table = CreateBuilder::new()
+            .with_location("memory:///")
+            .with_columns(schema.fields().cloned())
+            .with_configuration_property(TableProperty::AppendOnly, Some("true"))
+            .await
+            .unwrap();
+        let append = table
+            .snapshot()
+            .unwrap()
+            .metadata()
+            .configuration()
+            .get(TableProperty::AppendOnly.as_ref())
+            .unwrap()
+            .clone();
+        assert_eq!(String::from("true"), append)
+    }
+
+    /// Ensure that passing minimum versions into [CreateBuilder] result in properly creating the
+    /// table. Pre-fix this would cause:
+    ///
+    /// ```
+    ///     thread 'operations::create::tests::test_create_with_specified_version' (1956785) panicked at crates/core/src/kernel/models/actions.rs:326:69:
+    /// called `Result::unwrap()` on an `Err` value: Error("Invalid protocol action in the delta log: Writer features must be present when minimum writer version = 7", line: 0, column: 0)
+    /// ```
+    #[tokio::test]
+    async fn test_create_with_specified_version() {
+        let schema =
+            StructType::try_new(vec![StructField::new("id", DataType::INTEGER, true)]).unwrap();
+        let table = CreateBuilder::new()
+            .with_location("memory:///")
+            .with_columns(schema.fields().cloned())
+            .with_configuration(vec![("delta.minWriterVersion", Some("7"))])
+            .await
+            .expect("Failed to create the table correctly");
+        let snapshot = table.snapshot().unwrap();
+        let protocol = snapshot.protocol();
+
+        assert_eq!(
+            protocol.min_writer_version(),
+            7,
+            "The table did not set the expected minWriterVersion"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_create_with_upgradeable_property() -> DeltaResult<()> {
+        let table = DeltaTable::new_in_memory()
+            .create()
+            .with_columns(vec![StructField::new(
+                "id".to_string(),
+                DataType::INTEGER,
+                false,
+            )])
+            .with_configuration_property(TableProperty::EnableDeletionVectors, Some("true"))
+            .await?;
+        let snapshot = table.snapshot().unwrap();
+        let protocol = snapshot.protocol();
+        assert_eq!(
+            protocol.min_writer_version(),
+            7,
+            "The table did not set the expected minWriterVersion"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_create_table_with_variant_type_auto_enables_writer_version_7() {
+        // Test that creating a table with variant type automatically sets writer version to 7
+        // and enables appropriate writer features
+        // This test uses automatic behavior rather than explicit minWriterVersion configuration
+        // which avoids kernel validation issues
+        let schema = StructType::try_new(vec![
+            StructField::new("id", DataType::INTEGER, true),
+            StructField::new("v", DataType::unshredded_variant(), true),
+        ])
+        .unwrap();
+
+        let table = CreateBuilder::new()
+            .with_location("memory:///")
+            .with_columns(schema.fields().cloned())
+            .with_configuration(vec![
+                ("delta.appendOnly", Some("true")), // Add a configuration that enables writer features
+            ])
+            .await
+            .unwrap();
+
+        let snapshot = table.snapshot().unwrap();
+        let protocol = snapshot.protocol();
+
+        // Assert that writer protocol version is automatically set to 7 for variant types
+        assert_eq!(
+            protocol.min_writer_version(),
+            7,
+            "Variant types require writer version 7"
+        );
+
+        // Assert that writer features were enabled
+        let writer_features = protocol.writer_features();
+        assert!(
+            writer_features.is_some(),
+            "Writer features should be enabled when writer version >= 3"
+        );
+
+        let features = writer_features.unwrap();
+
+        // Assert that expected writer features are present
+        // Configuration-based features are added by move_table_properties_into_features
+        assert!(
+            features.contains(&TableFeature::AppendOnly),
+            "AppendOnly feature should be enabled by delta.appendOnly configuration"
+        );
+        assert!(
+            features.contains(&TableFeature::VariantType),
+            "VariantType feature should be enabled automatically for variant columns"
+        );
+
+        // Note: The version-based feature injection in create.rs (writer_features_for_version)
+        // adds ColumnMapping, Invariants, and AppendOnly for writer version 7.
+        // However, only unique features are added, so AppendOnly is already present from configuration.
+        // ColumnMapping and Invariants features are not automatically added in this test case
+        // because the logic may require specific conditions or they may be added elsewhere in the system.
+    }
+
+    #[tokio::test]
+    async fn test_create_table_auto_enables_variant_type() {
+        let schema = StructType::try_new(vec![
+            StructField::new("id", DataType::INTEGER, true),
+            StructField::new("v", DataType::unshredded_variant(), true),
+        ])
+        .unwrap();
+
+        let table = CreateBuilder::new()
+            .with_location("memory:///")
+            .with_columns(schema.fields().cloned())
+            .await
+            .unwrap();
+
+        let protocol = table.snapshot().unwrap().protocol();
+        assert_eq!(protocol.min_reader_version(), 3);
+        assert_eq!(protocol.min_writer_version(), 7);
+        assert!(
+            protocol
+                .reader_features()
+                .is_some_and(|features| features.contains(&TableFeature::VariantType))
+        );
+        assert!(
+            protocol
+                .writer_features()
+                .is_some_and(|features| features.contains(&TableFeature::VariantType))
+        );
+    }
+
+    #[cfg(feature = "datafusion")]
+    mod datafusion_tests {
+        use super::*;
+
+        use crate::writer::test_utils::get_record_batch;
+        #[tokio::test]
+        async fn test_create_table_save_mode() {
+            let tmp_dir = tempfile::tempdir().unwrap();
+
+            let schema = get_delta_schema();
+            let table = CreateBuilder::new()
+                .with_location(tmp_dir.path().to_str().unwrap())
+                .with_columns(schema.fields().cloned())
+                .await
+                .unwrap();
+            assert_eq!(table.version(), Some(0));
+            let first_id = table.snapshot().unwrap().metadata().id().to_string();
+
+            let log_store = table.log_store;
+
+            // Check an error is raised when a table exists at location
+            let table = CreateBuilder::new()
+                .with_log_store(log_store.clone())
+                .with_columns(schema.fields().cloned())
+                .with_save_mode(SaveMode::ErrorIfExists)
+                .await;
+            assert!(table.is_err());
+
+            // Check current table is returned when ignore option is chosen.
+            let table = CreateBuilder::new()
+                .with_log_store(log_store.clone())
+                .with_columns(schema.fields().cloned())
+                .with_save_mode(SaveMode::Ignore)
+                .await
+                .unwrap();
+            assert_eq!(table.snapshot().unwrap().metadata().id(), first_id);
+
+            // Check table is overwritten
+            let table = CreateBuilder::new()
+                .with_log_store(log_store)
+                .with_columns(schema.fields().cloned())
+                .with_save_mode(SaveMode::Overwrite)
+                .await
+                .unwrap();
+            assert_ne!(table.snapshot().unwrap().metadata().id(), first_id)
+        }
+
+        #[tokio::test]
+        async fn test_create_or_replace_existing_table() {
+            let batch = get_record_batch(None, false);
+            let schema = get_delta_schema();
+            let table = DeltaTable::new_in_memory()
+                .write(vec![batch.clone()])
+                .with_save_mode(SaveMode::ErrorIfExists)
+                .await
+                .unwrap();
+            let state = table.snapshot().unwrap();
+            assert_eq!(state.version(), 0);
+            assert_eq!(state.log_data().num_files(), 1);
+
+            let mut table = table
+                .create()
+                .with_columns(schema.fields().cloned())
+                .with_save_mode(SaveMode::Overwrite)
+                .await
+                .unwrap();
+            table.load().await.unwrap();
+            let state = table.snapshot().unwrap();
+            assert_eq!(state.version(), 1);
+            // Checks if files got removed after overwrite
+            assert_eq!(state.log_data().num_files(), 0);
+        }
+
+        #[tokio::test]
+        async fn test_create_or_replace_existing_table_partitioned() {
+            let batch = get_record_batch(None, false);
+            let schema = get_delta_schema();
+            let table = DeltaTable::new_in_memory()
+                .write(vec![batch.clone()])
+                .with_save_mode(SaveMode::ErrorIfExists)
+                .await
+                .unwrap();
+            let state = table.snapshot().unwrap();
+            assert_eq!(state.version(), 0);
+            assert_eq!(state.log_data().num_files(), 1);
+
+            let mut table = table
+                .create()
+                .with_columns(schema.fields().cloned())
+                .with_save_mode(SaveMode::Overwrite)
+                .with_partition_columns(vec!["id"])
+                .await
+                .unwrap();
+            table.load().await.unwrap();
+            let state = table.snapshot().unwrap();
+            assert_eq!(state.version(), 1);
+            // Checks if files got removed after overwrite
+            assert_eq!(state.log_data().num_files(), 0);
+        }
+
+        #[tokio::test]
+        async fn test_create_table_metadata_raise_if_key_not_exists() {
+            let schema = get_delta_schema();
+            let config: HashMap<String, Option<String>> =
+                vec![("key".to_string(), Some("value".to_string()))]
+                    .into_iter()
+                    .collect();
+
+            // Fail to create table with unknown Delta key
+            let table = CreateBuilder::new()
+                .with_location("memory:///")
+                .with_columns(schema.fields().cloned())
+                .with_configuration(config.clone())
+                .await;
+            assert!(table.is_err());
+
+            // Succeed in creating table with unknown Delta key since we set raise_if_key_not_exists to false
+            let table = CreateBuilder::new()
+                .with_location("memory:///")
+                .with_columns(schema.fields().cloned())
+                .with_raise_if_key_not_exists(false)
+                .with_configuration(config)
+                .await;
+            assert!(table.is_ok());
+
+            // Ensure the non-Delta key was set correctly
+            let value = table
+                .unwrap()
+                .snapshot()
+                .unwrap()
+                .metadata()
+                .configuration()
+                .get("key")
+                .unwrap()
+                .clone();
+            assert_eq!(String::from("value"), value);
+        }
+    }
+}

@@ -1,0 +1,213 @@
+use std::collections::HashMap;
+use std::future::Future;
+use std::iter::FromIterator;
+use std::time::Duration;
+
+use deltalake_core::kernel::transaction::CommitBuilder;
+use deltalake_core::kernel::{
+    Action, Add, DataType, PrimitiveType, StructField, StructType, Version,
+};
+use deltalake_core::protocol::{DeltaOperation, SaveMode};
+use deltalake_core::{DeltaTable, DeltaTableBuilder};
+
+use crate::utils::*;
+
+pub async fn test_concurrent_writes(context: &IntegrationContext) -> TestResult {
+    let (_table, table_uri) = prepare_table(context).await?;
+    run_test(|name| Worker::new(&table_uri, name)).await;
+    Ok(())
+}
+
+pub async fn test_concurrent_table_creation(context: &IntegrationContext) -> TestResult {
+    let table_uri = context.uri_for_table(TestTables::Custom("concurrent_create".into()));
+
+    if table_uri.starts_with("file://") {
+        let path = table_uri.strip_prefix("file://").unwrap();
+        std::fs::create_dir_all(path)?;
+    }
+
+    let schema = StructType::try_new(vec![StructField::new(
+        "Id",
+        DataType::Primitive(PrimitiveType::Integer),
+        true,
+    )])?;
+
+    const NUM_WRITERS: usize = 5;
+
+    // Spawn multiple tasks that all try to create the table simultaneously
+    let mut futures = Vec::new();
+    for i in 0..NUM_WRITERS {
+        let uri = table_uri.clone();
+        let schema = schema.clone();
+        futures.push(tokio::spawn(async move {
+            let table_url = url::Url::parse(&uri).unwrap();
+            let table = DeltaTableBuilder::from_url(table_url)
+                .unwrap()
+                .with_allow_http(true)
+                .build()
+                .unwrap();
+
+            // Each writer tries to create the table
+            let result = table.create().with_columns(schema.fields().cloned()).await;
+
+            (i, result)
+        }));
+    }
+
+    // Collect results - all writers must succeed
+    let mut versions = Vec::new();
+    for f in futures {
+        let (i, result) = f.await.unwrap();
+        let table = result.unwrap_or_else(|e| panic!("Writer {i} failed: {e}"));
+        versions.push(table.version());
+    }
+
+    // Exactly one should have version 0
+    let version_zero_count = versions.iter().filter(|v| **v == Some(0)).count();
+    assert_eq!(
+        version_zero_count, 1,
+        "Exactly one writer should get version 0"
+    );
+
+    Ok(())
+}
+
+async fn prepare_table(
+    context: &IntegrationContext,
+) -> Result<(DeltaTable, String), Box<dyn std::error::Error + 'static>> {
+    let schema = StructType::try_new(vec![StructField::new(
+        "Id".to_string(),
+        DataType::Primitive(PrimitiveType::Integer),
+        true,
+    )])?;
+
+    let table_uri = context.uri_for_table(TestTables::Custom("concurrent_workers".into()));
+
+    if table_uri.starts_with("file://") {
+        let path = table_uri.strip_prefix("file://").unwrap();
+        std::fs::create_dir_all(path)?;
+    }
+
+    let table_url = url::Url::parse(&table_uri)?;
+    let table = DeltaTableBuilder::from_url(table_url)?
+        .with_allow_http(true)
+        .build()?;
+
+    let table = table
+        .create()
+        .with_columns(schema.fields().cloned())
+        .await?;
+    let snapshot = table.snapshot()?;
+    assert_eq!(snapshot.version(), 0);
+    assert_eq!(snapshot.protocol().min_reader_version(), 1);
+    assert_eq!(snapshot.protocol().min_writer_version(), 2);
+    // assert_eq!(0, table.get_files_iter().count());
+
+    Ok((table, table_uri))
+}
+
+const WORKERS: u64 = 5;
+const COMMITS: Version = 3;
+
+async fn run_test<F, Fut>(create_worker: F)
+where
+    F: Fn(String) -> Fut,
+    Fut: Future<Output = Worker>,
+{
+    let mut workers = Vec::new();
+    for w in 0..WORKERS {
+        workers.push(create_worker(format!("w{w}")).await);
+    }
+
+    let mut futures = Vec::new();
+    for mut w in workers {
+        let run = tokio::spawn(async move { w.commit_sequence(COMMITS).await });
+        futures.push(run)
+    }
+
+    let mut map = HashMap::new();
+    for f in futures {
+        map.extend(f.await.unwrap());
+    }
+
+    // to ensure that there's been no collisions between workers of acquiring the same version
+    assert_eq!(map.len() as u64, WORKERS * COMMITS);
+
+    // check that we have unique and ascending versions committed
+    let mut versions = Vec::from_iter(map.keys().copied());
+    versions.sort();
+    assert_eq!(versions, Vec::from_iter(1u64..=WORKERS * COMMITS));
+
+    // check that each file for each worker is committed as expected
+    let mut files = Vec::from_iter(map.values().cloned());
+    files.sort();
+    let mut expected = Vec::new();
+    for w in 0..WORKERS {
+        for c in 0..COMMITS {
+            expected.push(format!("w{w}-{c}"))
+        }
+    }
+    assert_eq!(files, expected);
+}
+
+pub struct Worker {
+    pub table: DeltaTable,
+    pub name: String,
+}
+
+impl Worker {
+    pub async fn new(path: &str, name: String) -> Self {
+        unsafe { std::env::set_var("DYNAMO_LOCK_OWNER_NAME", &name) };
+        let table_url = url::Url::parse(path).unwrap();
+        let table = DeltaTableBuilder::from_url(table_url)
+            .unwrap()
+            .with_allow_http(true)
+            .load()
+            .await
+            .unwrap();
+        Self { table, name }
+    }
+
+    async fn commit_sequence(&mut self, n: Version) -> HashMap<Version, String> {
+        let mut result = HashMap::new();
+        for i in 0..n {
+            let name = format!("{}-{i}", self.name);
+            let v = self.commit_file(&name).await;
+            result.insert(v, name);
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        result
+    }
+
+    async fn commit_file(&mut self, name: &str) -> Version {
+        let operation = DeltaOperation::Write {
+            mode: SaveMode::Append,
+            partition_by: None,
+            predicate: None,
+        };
+        let actions = vec![Action::Add(Add {
+            path: format!("{name}.parquet"),
+            size: 396,
+            partition_values: HashMap::new(),
+            modification_time: 1564524294000,
+            data_change: true,
+            stats: None,
+            tags: None,
+            deletion_vector: None,
+            base_row_id: None,
+            default_row_commit_version: None,
+            clustering_provider: None,
+        })];
+        let snapshot = self.table.snapshot().unwrap().snapshot();
+
+        let version = CommitBuilder::default()
+            .with_actions(actions)
+            .build(Some(snapshot), self.table.log_store(), operation)
+            .await
+            .unwrap()
+            .version();
+        self.table.update_state().await.unwrap();
+        version
+    }
+}
