@@ -130,15 +130,27 @@ pub(super) async fn execution_plan(
     limit: Option<usize>,
     file_selection: Option<&ResolvedFileSelection>,
     runtime_filter: Option<&RuntimeFileFilter>,
+    #[cfg(feature = "metadata-metrics")]
+    metadata_metrics: Option<&crate::metadata_metrics::MetadataMetrics>,
+    #[cfg(feature = "metadata-metrics")]
+    is_filtered: bool,
 ) -> Result<Arc<dyn ExecutionPlan>> {
     if let Some(selection) = file_selection
         && selection.active_file_ids.is_empty()
     {
+        #[cfg(feature = "metadata-metrics")]
+        if let Some(metrics) = metadata_metrics {
+            metrics.record_candidate_files(0);
+        }
         return Ok(Arc::new(EmptyExec::new(
             scan_plan.contract.result_schema.clone(),
         )));
     }
 
+    #[cfg(feature = "metadata-metrics")]
+    let _replay = metadata_metrics.map(|metrics| {
+        metrics.stage(if is_filtered { "metadata_file_pruning" } else { "active_file_enumeration" })
+    });
     let replayed = replay_files(
         Arc::clone(&engine),
         &scan_plan,
@@ -147,6 +159,13 @@ pub(super) async fn execution_plan(
         file_selection,
     )
     .await?;
+    #[cfg(feature = "metadata-metrics")]
+    {
+        if let Some(metrics) = metadata_metrics {
+            metrics.record_candidate_files(replayed.files.len());
+        }
+        drop(_replay);
+    }
 
     let file_id_field = scan_plan.contract.file_id_field.clone();
     if scan_plan.is_metadata_only() && !scan_plan.contract.retain_row_index {
@@ -1279,7 +1298,8 @@ mod tests {
             MissingSelectedFilePolicy::Error,
         );
 
-        let plan = execution_plan(
+        #[cfg(feature = "metadata-metrics")]
+        let execution = execution_plan(
             &DeltaScanConfig::default(),
             &state,
             scan_plan,
@@ -1288,8 +1308,15 @@ mod tests {
             None,
             Some(&selection),
             None,
-        )
-        .await?;
+            None,
+            false,
+        );
+        #[cfg(not(feature = "metadata-metrics"))]
+        let execution = execution_plan(
+            &DeltaScanConfig::default(), &state, scan_plan, stream, engine,
+            None, Some(&selection), None,
+        );
+        let plan = execution.await?;
 
         assert!(plan.is::<EmptyExec>());
 

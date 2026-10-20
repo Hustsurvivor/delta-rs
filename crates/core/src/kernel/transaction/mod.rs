@@ -628,6 +628,8 @@ pub struct CommitBuilder {
     app_transaction: Vec<Transaction>,
     max_retries: usize,
     post_commit_hook: Option<PostCommitHookProperties>,
+    #[cfg(feature = "metadata-metrics")]
+    metadata_metrics: Option<crate::metadata_metrics::MetadataMetrics>,
 }
 
 impl Default for CommitBuilder {
@@ -638,11 +640,22 @@ impl Default for CommitBuilder {
             app_transaction: Vec::new(),
             max_retries: DEFAULT_RETRIES,
             post_commit_hook: None,
+            #[cfg(feature = "metadata-metrics")]
+            metadata_metrics: None,
         }
     }
 }
 
 impl<'a> CommitBuilder {
+    /// Attach a collector to this one real commit, including all retry attempts.
+    #[cfg(feature = "metadata-metrics")]
+    pub fn with_metadata_metrics(
+        mut self,
+        metrics: crate::metadata_metrics::MetadataMetrics,
+    ) -> Self {
+        self.metadata_metrics = Some(metrics);
+        self
+    }
     /// Actions to be included in the commit
     pub fn with_actions(mut self, actions: Vec<Action>) -> Self {
         self.actions = actions;
@@ -677,6 +690,8 @@ impl<'a> CommitBuilder {
         log_store: LogStoreRef,
         operation: DeltaOperation,
     ) -> PreCommit<'a> {
+        #[cfg(feature = "metadata-metrics")]
+        let _payload = self.metadata_metrics.as_ref().map(|m| m.stage("commit_payload_build"));
         let data = CommitData::new(
             self.actions,
             operation,
@@ -689,6 +704,8 @@ impl<'a> CommitBuilder {
             max_retries: self.max_retries,
             data,
             post_commit_hook: self.post_commit_hook,
+            #[cfg(feature = "metadata-metrics")]
+            metadata_metrics: self.metadata_metrics,
         }
     }
 }
@@ -700,6 +717,8 @@ pub struct PreCommit<'a> {
     data: CommitData,
     max_retries: usize,
     post_commit_hook: Option<PostCommitHookProperties>,
+    #[cfg(feature = "metadata-metrics")]
+    metadata_metrics: Option<crate::metadata_metrics::MetadataMetrics>,
 }
 
 impl<'a> IntoFuture for PreCommit<'a> {
@@ -729,6 +748,8 @@ impl<'a> PreCommit<'a> {
         }
 
         Box::pin(async move {
+            #[cfg(feature = "metadata-metrics")]
+            let _preparation = this.metadata_metrics.as_ref().map(|m| m.stage("commit_payload_preparation"));
             if let Some(table_reference) = this.table_data {
                 PROTOCOL.can_commit(table_reference, &this.data.actions, &this.data.operation)?;
             }
@@ -752,6 +773,8 @@ impl<'a> PreCommit<'a> {
                 max_retries: this.max_retries,
                 data: this.data,
                 post_commit: this.post_commit_hook,
+                #[cfg(feature = "metadata-metrics")]
+                metadata_metrics: this.metadata_metrics,
             })
         })
     }
@@ -766,6 +789,8 @@ pub struct PreparedCommit<'a> {
     table_data: Option<&'a dyn TableReference>,
     max_retries: usize,
     post_commit: Option<PostCommitHookProperties>,
+    #[cfg(feature = "metadata-metrics")]
+    metadata_metrics: Option<crate::metadata_metrics::MetadataMetrics>,
 }
 
 impl PreparedCommit<'_> {
@@ -789,6 +814,8 @@ impl<'a> IntoFuture for PreparedCommit<'a> {
             let data = this.data;
             let post_commit = this.post_commit;
             let max_retries = this.max_retries;
+            #[cfg(feature = "metadata-metrics")]
+            let metadata_metrics = this.metadata_metrics;
 
             // The version of the most recent commit attempt. Every non-success exit aborts that
             // attempt so that temporary commit files and staged commit entries do not leak.
@@ -802,7 +829,12 @@ impl<'a> IntoFuture for PreparedCommit<'a> {
                     table_data.eager_snapshot().clone()
                 } else {
                     debug!("committing initial table version 0");
-                    match committer.commit(0, commit_or_bytes.clone()).await {
+                    #[cfg(feature = "metadata-metrics")]
+                    let atomic_write = metadata_metrics.as_ref().map(|m| m.stage("atomic_log_write"));
+                    let initial_result = committer.commit(0, commit_or_bytes.clone()).await;
+                    #[cfg(feature = "metadata-metrics")]
+                    drop(atomic_write);
+                    match initial_result {
                         Ok(CommitResponse::Committed) => {
                             return Ok(PostCommit {
                                 version: 0,
@@ -812,6 +844,8 @@ impl<'a> IntoFuture for PreparedCommit<'a> {
                                 log_store,
                                 table_data: None,
                                 metrics: CommitMetrics { num_retries: 0 },
+                                #[cfg(feature = "metadata-metrics")]
+                                metadata_metrics: metadata_metrics.clone(),
                             });
                         }
                         Ok(CommitResponse::Conflict { .. })
@@ -820,7 +854,11 @@ impl<'a> IntoFuture for PreparedCommit<'a> {
                             // check. Load the current table state and continue with the retry loop.
                             debug!("version 0 already exists, loading table state for retry");
                             attempt_number = 2;
+                            #[cfg(feature = "metadata-metrics")]
+                            let validation = metadata_metrics.as_ref().map(|m| m.stage("latest_version_validation"));
                             let latest_version: Version = log_store.get_latest_version(0).await?;
+                            #[cfg(feature = "metadata-metrics")]
+                            drop(validation);
                             EagerSnapshot::try_new(log_store.as_ref(), Some(latest_version)).await?
                         }
                         Err(e) => return Err(e.into()),
@@ -842,9 +880,13 @@ impl<'a> IntoFuture for PreparedCommit<'a> {
                     let total_retries = max_retries + 1;
                     while attempt_number <= total_retries {
                         Span::current().record("attempt", attempt_number);
+                        #[cfg(feature = "metadata-metrics")]
+                        let validation = metadata_metrics.as_ref().map(|m| m.stage("latest_version_validation"));
                         let latest_version = log_store
                             .get_latest_version(read_snapshot.version())
                             .await?;
+                        #[cfg(feature = "metadata-metrics")]
+                        drop(validation);
 
                         if latest_version > read_snapshot.version() {
                             // If max_retries are set to 0, do not try to use the conflict checker to resolve the conflict
@@ -868,6 +910,8 @@ impl<'a> IntoFuture for PreparedCommit<'a> {
                             );
                             let mut steps = latest_version - read_snapshot.version();
                             let mut conflicts_checked = 0;
+                            #[cfg(feature = "metadata-metrics")]
+                            let conflict_stage = metadata_metrics.as_ref().map(|m| m.stage("conflict_detection"));
 
                             // Need to check for conflicts with each version between the read_snapshot and
                             // the latest!
@@ -909,6 +953,8 @@ impl<'a> IntoFuture for PreparedCommit<'a> {
                                 steps -= 1;
                             }
                             Span::current().record("conflicts_checked", conflicts_checked);
+                            #[cfg(feature = "metadata-metrics")]
+                            drop(conflict_stage);
                             debug!(
                                 conflicts_checked = conflicts_checked,
                                 "all conflicts resolved, updating snapshot"
@@ -942,7 +988,12 @@ impl<'a> IntoFuture for PreparedCommit<'a> {
                             }
                         };
 
-                        match committer.commit(version, updated_commit_or_bytes).await {
+                        #[cfg(feature = "metadata-metrics")]
+                        let atomic_write = metadata_metrics.as_ref().map(|m| m.stage("atomic_log_write"));
+                        let commit_result = committer.commit(version, updated_commit_or_bytes).await;
+                        #[cfg(feature = "metadata-metrics")]
+                        drop(atomic_write);
+                        match commit_result {
                             Ok(CommitResponse::Committed) => {
                                 info!(
                                     version = version,
@@ -963,6 +1014,8 @@ impl<'a> IntoFuture for PreparedCommit<'a> {
                                     metrics: CommitMetrics {
                                         num_retries: (attempt_number - 1) as u64,
                                     },
+                                    #[cfg(feature = "metadata-metrics")]
+                                    metadata_metrics: metadata_metrics.clone(),
                                 });
                             }
                             Ok(CommitResponse::Conflict { .. })
@@ -1024,18 +1077,24 @@ pub struct PostCommit {
     log_store: LogStoreRef,
     table_data: Option<Box<dyn TableReference>>,
     metrics: CommitMetrics,
+    #[cfg(feature = "metadata-metrics")]
+    metadata_metrics: Option<crate::metadata_metrics::MetadataMetrics>,
 }
 
 impl PostCommit {
     /// Runs the post commit activities
     async fn run_post_commit_hook(&self) -> DeltaResult<(DeltaTableState, PostCommitMetrics)> {
         if let Some(table) = &self.table_data {
+            #[cfg(feature = "metadata-metrics")]
+            let snapshot_stage = self.metadata_metrics.as_ref().map(|m| m.stage("post_commit_snapshot_processing"));
             let mut snapshot = table.eager_snapshot().clone();
             if self.version != snapshot.version() {
                 snapshot.update(&self.log_store, Some(self.version)).await?;
             }
 
             let mut state = DeltaTableState { snapshot };
+            #[cfg(feature = "metadata-metrics")]
+            drop(snapshot_stage);
 
             let cleanup_logs = if let Some(cleanup_logs) = self.cleanup_expired_logs {
                 cleanup_logs
@@ -1080,7 +1139,11 @@ impl PostCommit {
                 new_checkpoint_created = checkpoint_created;
                 num_log_files_cleaned_up = files_cleaned_up;
                 if num_log_files_cleaned_up > 0 {
+                    #[cfg(feature = "metadata-metrics")]
+                    let snapshot_stage = self.metadata_metrics.as_ref().map(|m| m.stage("post_commit_snapshot_processing"));
                     state = DeltaTableState::try_new(&self.log_store, Some(self.version)).await?;
+                    #[cfg(feature = "metadata-metrics")]
+                    drop(snapshot_stage);
                 }
             }
 
@@ -1092,7 +1155,11 @@ impl PostCommit {
                 },
             ))
         } else {
+            #[cfg(feature = "metadata-metrics")]
+            let snapshot_stage = self.metadata_metrics.as_ref().map(|m| m.stage("post_commit_snapshot_processing"));
             let state = DeltaTableState::try_new(&self.log_store, Some(self.version)).await?;
+            #[cfg(feature = "metadata-metrics")]
+            drop(snapshot_stage);
             Ok((
                 state,
                 PostCommitMetrics {

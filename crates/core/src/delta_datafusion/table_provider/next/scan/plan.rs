@@ -272,11 +272,42 @@ impl KernelScanPlan {
         config: &DeltaScanConfig,
         skipping_predicate: Option<Vec<Expr>>,
     ) -> Result<Self> {
+        #[cfg(feature = "metadata-metrics")]
+        { Self::try_new_with_contract_impl(snapshot, contract, filters, config, skipping_predicate, None) }
+        #[cfg(not(feature = "metadata-metrics"))]
+        { Self::try_new_with_contract_impl(snapshot, contract, filters, config, skipping_predicate) }
+    }
+
+    #[cfg(feature = "metadata-metrics")]
+    pub(crate) fn try_new_with_contract_and_metrics(
+        snapshot: &Snapshot,
+        contract: ProjectedScanContract,
+        filters: &[Expr],
+        config: &DeltaScanConfig,
+        skipping_predicate: Option<Vec<Expr>>,
+        metrics: Option<&crate::metadata_metrics::MetadataMetrics>,
+    ) -> Result<Self> {
+        Self::try_new_with_contract_impl(
+            snapshot, contract, filters, config, skipping_predicate, metrics,
+        )
+    }
+
+    fn try_new_with_contract_impl(
+        snapshot: &Snapshot,
+        contract: ProjectedScanContract,
+        filters: &[Expr],
+        config: &DeltaScanConfig,
+        skipping_predicate: Option<Vec<Expr>>,
+        #[cfg(feature = "metadata-metrics")]
+        metrics: Option<&crate::metadata_metrics::MetadataMetrics>,
+    ) -> Result<Self> {
         let table_config = snapshot.table_configuration();
         let kernel_logical_schema = table_config.logical_schema();
 
         // At this point we should only have supported predicates, but we decide where
         // when can handle them (kernel scan and/or parquet scan)
+        #[cfg(feature = "metadata-metrics")]
+        let _predicate = metrics.map(|metrics| metrics.stage("predicate_preparation"));
         let (kernel_predicate, parquet_predicate) = process_filters(filters, table_config, config)?;
 
         // if some dedicated file skipping predicate is supplied,
@@ -293,6 +324,8 @@ impl KernelScanPlan {
         } else {
             kernel_predicate
         };
+        #[cfg(feature = "metadata-metrics")]
+        drop(_predicate);
 
         let scan_builder = snapshot
             .scan_builder()

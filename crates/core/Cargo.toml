@@ -139,6 +139,10 @@ delta-cache = ["foyer", "tempfile", "url/serde"]
 nanosecond-timestamps = ["delta_kernel/nanosecond-timestamps"]
 
 integration_test = []
+# Opt-in, allocation-light timing helpers for metadata-only experiments.  The
+# collector is explicit (there is no process-global timer), so concurrent
+# benchmark runs cannot mix their samples.
+metadata-metrics = []
 
 # All integration tests are consolidated into two test binaries to keep
 # compile and link time down — see

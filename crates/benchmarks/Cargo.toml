@@ -19,14 +19,25 @@ chrono = { workspace = true, default-features = false, features = ["clock"] }
 futures = { workspace = true }
 object_store = { workspace = true }
 anyhow = "1"
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+delta_kernel.workspace = true
 
 [dependencies.deltalake-core]
 path = "../core"
 version = "2"
-features = ["datafusion"]
+features = ["datafusion", "metadata-metrics"]
 
 [dev-dependencies]
 divan = "0.1"
+
+[[bin]]
+name = "write_lineitem"
+path = "../../damlake_test/write_lineitem.rs"
+
+[[bin]]
+name = "scan_lineitem"
+path = "../../damlake_test/scan_lineitem.rs"
 
 [[bench]]
 name = "merge"

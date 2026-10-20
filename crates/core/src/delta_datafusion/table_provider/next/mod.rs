@@ -499,6 +499,9 @@ pub struct DeltaScan {
     file_selection: Option<FileSelection>,
     #[serde(skip)]
     runtime_file_filter: Option<RuntimeFileFilter>,
+    #[cfg(feature = "metadata-metrics")]
+    #[serde(skip)]
+    metadata_metrics: Option<crate::metadata_metrics::MetadataMetrics>,
 }
 
 /// Deletion vector selection for one data file.
@@ -541,6 +544,8 @@ impl DeltaScan {
             log_store: None,
             file_selection: None,
             runtime_file_filter: None,
+            #[cfg(feature = "metadata-metrics")]
+            metadata_metrics: None,
         })
     }
 
@@ -602,6 +607,21 @@ impl DeltaScan {
     pub(crate) fn with_log_store(mut self, log_store: impl Into<LogStoreRef>) -> Self {
         self.log_store = Some(log_store.into());
         self
+    }
+
+    #[cfg(feature = "metadata-metrics")]
+    pub(crate) fn with_metadata_metrics(
+        mut self,
+        metrics: crate::metadata_metrics::MetadataMetrics,
+    ) -> Self {
+        self.metadata_metrics = Some(metrics);
+        self
+    }
+
+    /// Version of the snapshot used by this provider, including latest-version resolution.
+    #[cfg(feature = "metadata-metrics")]
+    pub fn snapshot_version(&self) -> u64 {
+        self.snapshot.snapshot().version()
     }
 
     fn validate_supported_reader_features(
@@ -743,6 +763,16 @@ impl TableProvider for DeltaScan {
             projection,
             filters,
         )?;
+        #[cfg(feature = "metadata-metrics")]
+        let scan_plan = KernelScanPlan::try_new_with_contract_and_metrics(
+            self.snapshot.snapshot(),
+            contract,
+            filters,
+            &self.config,
+            self.file_skipping_predicate.clone(),
+            self.metadata_metrics.as_ref(),
+        )?;
+        #[cfg(not(feature = "metadata-metrics"))]
         let scan_plan = KernelScanPlan::try_new_with_contract(
             self.snapshot.snapshot(),
             contract,
@@ -756,7 +786,8 @@ impl TableProvider for DeltaScan {
             .await?;
         let stream = self.scan_metadata_stream(&scan_plan, engine.clone());
 
-        scan::execution_plan(
+        #[cfg(feature = "metadata-metrics")]
+        let execution = scan::execution_plan(
             &self.config,
             session,
             scan_plan,
@@ -765,8 +796,15 @@ impl TableProvider for DeltaScan {
             limit,
             resolved_file_selection.as_ref(),
             self.runtime_file_filter.as_ref(),
-        )
-        .await
+            self.metadata_metrics.as_ref(),
+            !filters.is_empty() || self.file_skipping_predicate.is_some(),
+        );
+        #[cfg(not(feature = "metadata-metrics"))]
+        let execution = scan::execution_plan(
+            &self.config, session, scan_plan, stream, engine, limit,
+            resolved_file_selection.as_ref(), self.runtime_file_filter.as_ref(),
+        );
+        execution.await
     }
 
     async fn insert_into(

@@ -252,6 +252,10 @@ pub struct TableProviderBuilder {
     file_skipping_predicates: Option<Vec<Expr>>,
     file_selection: Option<next::FileSelection>,
     runtime_file_filter: Option<next::RuntimeFileFilter>,
+    /// Optional per-query metadata timer. Kept out of serialized plans so it
+    /// cannot leak between independent query executions.
+    #[cfg(feature = "metadata-metrics")]
+    metadata_metrics: Option<crate::metadata_metrics::MetadataMetrics>,
 }
 
 impl fmt::Debug for TableProviderBuilder {
@@ -288,12 +292,27 @@ impl TableProviderBuilder {
             file_skipping_predicates: None,
             file_selection: None,
             runtime_file_filter: None,
+            #[cfg(feature = "metadata-metrics")]
+            metadata_metrics: None,
         }
     }
 
     /// Provide the log store to use for the table provider
     pub fn with_log_store(mut self, log_store: impl Into<Arc<dyn LogStore>>) -> Self {
         self.log_store = Some(log_store.into());
+        self
+    }
+
+    /// Attach a collector to the real provider-build and scan-planning path.
+    ///
+    /// The collector is intentionally supplied by the caller, making a single
+    /// query execution the unit of attribution instead of using a global timer.
+    #[cfg(feature = "metadata-metrics")]
+    pub fn with_metadata_metrics(
+        mut self,
+        metrics: crate::metadata_metrics::MetadataMetrics,
+    ) -> Self {
+        self.metadata_metrics = Some(metrics);
         self
     }
 
@@ -395,6 +414,8 @@ impl TableProviderBuilder {
             file_skipping_predicates,
             file_selection,
             runtime_file_filter,
+            #[cfg(feature = "metadata-metrics")]
+            metadata_metrics,
         } = self;
 
         let mut config = session
@@ -410,9 +431,11 @@ impl TableProviderBuilder {
             Some(wrapper) => wrapper,
             None => {
                 if let Some(log_store) = log_store.as_ref() {
-                    SnapshotWrapper::Snapshot(
-                        Snapshot::try_new(log_store, table_version).await?.into(),
-                    )
+                    #[cfg(feature = "metadata-metrics")]
+                    let _stage = metadata_metrics
+                        .as_ref()
+                        .map(|metrics| metrics.stage("snapshot_reconstruction"));
+                    SnapshotWrapper::Snapshot(Snapshot::try_new(log_store, table_version).await?.into())
                 } else {
                     return Err(DataFusionError::Plan(
                         "Either a log store or a snapshot must be provided to build a Delta TableProvider".to_string(),
@@ -442,6 +465,10 @@ impl TableProviderBuilder {
         }
         if let Some(log_store) = log_store {
             provider = provider.with_log_store(log_store);
+        }
+        #[cfg(feature = "metadata-metrics")]
+        if let Some(metrics) = metadata_metrics {
+            provider = provider.with_metadata_metrics(metrics);
         }
 
         if let Some(skipping) = file_skipping_predicates {

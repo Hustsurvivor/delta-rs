@@ -84,6 +84,8 @@ pub mod datafile;
 pub mod errors;
 pub mod kernel;
 pub mod logstore;
+#[cfg(feature = "metadata-metrics")]
+pub mod metadata_metrics;
 pub mod operations;
 pub(crate) mod parquet_utils;
 pub mod protocol;
